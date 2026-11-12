@@ -7,7 +7,11 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  activity?: SearchActivity[];
+  phase?: string;
 };
+
+type SearchActivity = { id: string; query: string; status: "searching" | "complete" | "failed"; sources: Array<{ title: string; url: string }> };
 
 type SavedConversation = {
   id: string;
@@ -81,26 +85,74 @@ function formatDate(date: string) {
 }
 
 function MessageText({ content }: { content: string }) {
-  const urlPattern = /(https?:\/\/[^\s)\]>]+)/g;
-  const paragraphs = content.split(/\n{2,}/);
+  const normalized = content.replace(/(https?:\/\/[^\s)\]>]+)(?:\s*\1){2,}/g, "$1 [repeated link omitted]");
+  const lines = normalized.replace(/\r\n?/g, "\n").split("\n");
+  const blocks: Array<{ type: "paragraph" | "ul" | "ol" | "code" | "hr" | "heading"; lines: string[]; level?: number }> = [];
+  let current: (typeof blocks)[number] | null = null;
+  let codeFence = false;
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      if (codeFence) { if (current) blocks.push(current); current = null; }
+      else { if (current) blocks.push(current); current = { type: "code", lines: [] }; }
+      codeFence = !codeFence;
+      continue;
+    }
+    if (codeFence) { current?.lines.push(line); continue; }
+    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+)$/);
+    const list = line.match(/^\s*(?:([-*+])\s+|\d+[.)]\s+)(.+)$/);
+    if (!line.trim()) { if (current) blocks.push(current); current = null; continue; }
+    if (/^\s*(---+|\*\*\*+)\s*$/.test(line)) { if (current) blocks.push(current); current = null; blocks.push({ type: "hr", lines: [] }); continue; }
+    if (heading) { if (current) blocks.push(current); blocks.push({ type: "heading", level: heading[1].length, lines: [heading[2]] }); current = null; continue; }
+    if (list) {
+      const type = /^\s*\d/.test(line) ? "ol" : "ul";
+      if (current?.type !== type) { if (current) blocks.push(current); current = { type, lines: [] }; }
+      current.lines.push(list[2]);
+      continue;
+    }
+    if (current?.type !== "paragraph") { if (current) blocks.push(current); current = { type: "paragraph", lines: [] }; }
+    current.lines.push(line);
+  }
+  if (current) blocks.push(current);
 
-  return (
-    <div className="message-copy">
-      {paragraphs.map((paragraph, paragraphIndex) => (
-        <p key={`${paragraphIndex}-${paragraph.slice(0, 20)}`}>
-          {paragraph.split(urlPattern).map((part, partIndex) =>
-            /^https?:\/\//.test(part) ? (
-              <a key={`${partIndex}-${part}`} href={part} target="_blank" rel="noreferrer">
-                {part}
-              </a>
-            ) : (
-              <span key={`${partIndex}-${part.slice(0, 20)}`}>{part}</span>
-            ),
-          )}
-        </p>
-      ))}
-    </div>
-  );
+  const inline = (text: string, prefix: string): React.ReactNode[] => {
+    const pattern = /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s)\]]+|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_)/g;
+    const output: React.ReactNode[] = [];
+    let cursor = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text))) {
+      if (match.index > cursor) output.push(text.slice(cursor, match.index));
+      const token = match[0]; const key = `${prefix}-${match.index}`;
+      const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+      if (link) { try { const url = new URL(link[2]); if (url.protocol === "http:" || url.protocol === "https:") output.push(<a key={key} href={url.href} target="_blank" rel="noreferrer">{link[1]}</a>); else output.push(link[1]); } catch { output.push(link[1]); } }
+      else if (/^https?:\/\//.test(token)) { const href = token.replace(/[.,;:!?]+$/, ""); try { const url = new URL(href); if (url.protocol === "http:" || url.protocol === "https:") output.push(<a key={key} href={url.href} target="_blank" rel="noreferrer">{href}</a>); else output.push(href); } catch { output.push(href); } if (href.length < token.length) output.push(token.slice(href.length)); }
+      else if (token.startsWith("`")) output.push(<code key={key}>{token.slice(1, -1)}</code>);
+      else if (token.startsWith("**")) output.push(<strong key={key}>{token.slice(2, -2)}</strong>);
+      else output.push(<em key={key}>{token.slice(1, -1)}</em>);
+      cursor = pattern.lastIndex;
+    }
+    if (cursor < text.length) output.push(text.slice(cursor));
+    return output;
+  };
+  return <div className="message-copy">{blocks.map((block, index) => {
+    const key = `block-${index}`; const value = block.lines.join(block.type === "paragraph" ? "\n" : "");
+    if (block.type === "hr") return <hr key={key} />;
+    if (block.type === "code") return <pre key={key}><code>{value}</code></pre>;
+    if (block.type === "heading") { const Tag = `h${block.level}` as "h1"; return <Tag key={key}>{inline(value, key)}</Tag>; }
+    if (block.type === "ul" || block.type === "ol") { const Tag = block.type; return <Tag key={key}>{block.lines.map((item, itemIndex) => <li key={`${key}-${itemIndex}`}>{inline(item, `${key}-${itemIndex}`)}</li>)}</Tag>; }
+    return <p key={key}>{inline(value, key)}</p>;
+  })}</div>;
+}
+
+function SearchActivityView({ activity, phase }: { activity: SearchActivity[]; phase?: string }) {
+  if (!activity.length && !phase) return null;
+  const sourceCount = activity.reduce((count, item) => count + item.sources.length, 0);
+  return <details className="search-activity" open>
+    <summary><span className="activity-pulse" />{phase ?? "Research activity"}<span className="activity-count">{activity.length} {activity.length === 1 ? "search" : "searches"}{sourceCount ? ` · ${sourceCount} sources` : ""}</span></summary>
+    <div className="activity-list">{activity.map((item) => <section key={item.id} className="activity-query">
+      <div className="activity-query-title"><span className={`activity-state activity-state-${item.status}`} />{item.status === "searching" ? "Searching" : item.status === "failed" ? "Search unavailable" : "Searched"}: {item.query}</div>
+      {!!item.sources.length && <ul>{item.sources.map((source) => { let domain = source.url; try { domain = new URL(source.url).hostname; } catch { /* ignore malformed source */ } return <li key={`${item.id}-${source.url}`}><a href={source.url} target="_blank" rel="noreferrer">{source.title || domain}</a><span>{domain}</span></li>; })}</ul>}
+    </section>)}{!activity.length && <p>Preparing your search.</p>}</div>
+  </details>;
 }
 
 export default function ChatWorkspace() {
@@ -151,7 +203,7 @@ export default function ChatWorkspace() {
     const timeout = window.setTimeout(() => {
       try {
         const updated: SavedConversation[] = messages.length
-          ? [{ id: activeId, title: firstQuestion(messages).slice(0, 90), updatedAt: new Date().toISOString(), messages: messages.slice(-40) },
+          ? [{ id: activeId, title: firstQuestion(messages).slice(0, 90), updatedAt: messages.at(-1)?.createdAt ?? new Date().toISOString(), messages: messages.slice(-40) },
             ...conversationsRef.current.filter((conversation) => conversation.id !== activeId)]
           : conversationsRef.current.filter((conversation) => conversation.id !== activeId);
         const limited = updated.slice(0, 30);
@@ -211,7 +263,7 @@ export default function ChatWorkspace() {
     if (!activeIdRef.current) setActiveId(conversationId);
     const userMessage: Message = { id: makeId(), role: "user", content, createdAt: new Date().toISOString() };
     const assistantId = makeId();
-    const assistantMessage: Message = { id: assistantId, role: "assistant", content: "", createdAt: new Date().toISOString() };
+    const assistantMessage: Message = { id: assistantId, role: "assistant", content: "", createdAt: new Date().toISOString(), activity: [], phase: "Preparing research" };
     setMessages((current) => [...current, userMessage, assistantMessage]);
     setInput("");
     setError("");
@@ -224,7 +276,7 @@ export default function ChatWorkspace() {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: content, conversationId }),
+        body: JSON.stringify({ message: content, conversationId, streamMode: "events", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
         signal: controller.signal,
       });
 
@@ -242,14 +294,43 @@ export default function ChatWorkspace() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let answer = "";
+      let pending = "";
+      const updateActivity = (update: (activity: SearchActivity[]) => SearchActivity[], phase?: string) => {
+        setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, activity: update(message.activity ?? []), phase: phase ?? message.phase } : message));
+      };
+      const handleEvent = (raw: string) => {
+        if (!raw.trim()) return;
+        const item = JSON.parse(raw) as { type: string; text?: string; queries?: unknown[]; results?: unknown; message?: string };
+        if (item.type === "delta" && typeof item.text === "string") {
+          answer += item.text;
+          setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: answer, phase: "Writing answer" } : message));
+        } else if (item.type === "search-start") {
+          const queries = (item.queries ?? []).filter((query): query is string => typeof query === "string");
+          updateActivity((activity) => [...activity, ...queries.map((query) => ({ id: makeId(), query, status: "searching" as const, sources: [] }))], "Searching the web");
+        } else if (item.type === "search-results") {
+          const results = Array.isArray(item.results) ? item.results as Array<{ searchQuery?: string; title?: string; url?: string; error?: string }> : [];
+          updateActivity((activity) => activity.map((entry) => {
+            const matching = results.filter((result) => result.searchQuery === entry.query);
+            if (!matching.length) return entry;
+            return { ...entry, status: matching.some((result) => result.url) ? "complete" : "failed", sources: matching.flatMap((result) => result.url ? [{ title: result.title ?? result.url, url: result.url }] : []) };
+          }), "Reviewing sources");
+        } else if (item.type === "done") {
+          setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, phase: undefined } : message));
+        } else if (item.type === "error") {
+          throw new Error(item.message ?? "Minimi could not complete this request.");
+        }
+      };
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        answer += decoder.decode(value, { stream: true });
-        setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: answer } : message));
+        pending += decoder.decode(value, { stream: true });
+        const chunks = pending.split("\n");
+        pending = chunks.pop() ?? "";
+        for (const chunk of chunks) handleEvent(chunk);
       }
-      answer += decoder.decode();
-      setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: answer } : message));
+      pending += decoder.decode();
+      if (pending.trim()) handleEvent(pending);
+      setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, phase: undefined } : message));
     } catch (caught) {
       if (caught instanceof Error && caught.name === "AbortError") {
         setMessages((current) => current.filter((message) => message.id !== assistantId || message.content.length > 0));
@@ -266,6 +347,19 @@ export default function ChatWorkspace() {
   }, [input, isStreaming]);
 
   const currentTitle = messages.length ? firstQuestion(messages) : "New research";
+  const composer = (
+    <div className={`composer-area${messages.length === 0 ? " composer-area-centered" : ""}`}>
+      {messages.length > 0 && error && <div className="composer-error" role="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
+      <form className="composer" onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}>
+        <label className="sr-only" htmlFor="research-question">Ask Minimi a research question</label>
+        <textarea id="research-question" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Ask a question or revisit something you researched…" rows={1} disabled={!isHydrated} />
+        <div className="composer-footer"><span className="composer-hint"><Icon name="clock" size={14} /> Past research stays attached to this conversation</span>
+          {isStreaming ? <button type="button" className="send-button stop-button" onClick={() => abortRef.current?.abort()} aria-label="Stop response"><Icon name="stop" size={17} /></button> : <button type="submit" className="send-button" disabled={!input.trim()} aria-label="Send question"><Icon name="send" size={17} /></button>}
+        </div>
+      </form>
+      <p className="composer-disclaimer">Minimi can make mistakes. Check important details against the linked sources.</p>
+    </div>
+  );
 
   return (
     <div className="minimi-shell">
@@ -350,6 +444,8 @@ export default function ChatWorkspace() {
                   Minimi keeps the sources and dates behind your research, so you can come back and see what has changed.
                 </p>
 
+                {composer}
+
                 <div className="suggestion-list" aria-label="Try a research question">
                   {suggestions.map((suggestion) => (
                     <button key={suggestion.label} className="suggestion-row" onClick={() => void sendMessage(suggestion.prompt)}>
@@ -370,8 +466,9 @@ export default function ChatWorkspace() {
                     ) : null}
                     <div className="message-body">
                       {message.role === "assistant" && <div className="message-author">Minimi <span>Research assistant</span></div>}
+                        {message.role === "assistant" && <SearchActivityView activity={message.activity ?? []} phase={message.phase} />}
                       {message.content ? <MessageText content={message.content} /> : (
-                        <div className="thinking-indicator"><span /><span /><span /><span>Looking across your research and current sources</span></div>
+                        <div className="thinking-indicator"><span /><span /><span /><span>Working on your answer</span></div>
                       )}
                     </div>
                   </article>
@@ -380,35 +477,7 @@ export default function ChatWorkspace() {
             )}
           </div>
 
-          <div className="composer-area">
-            {messages.length > 0 && error && <div className="composer-error" role="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
-            <form className="composer" onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}>
-              <label className="sr-only" htmlFor="research-question">Ask Minimi a research question</label>
-              <textarea
-                id="research-question"
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    void sendMessage();
-                  }
-                }}
-                placeholder="Ask a question or revisit something you researched…"
-                rows={1}
-                disabled={!isHydrated}
-              />
-              <div className="composer-footer">
-                <span className="composer-hint"><Icon name="clock" size={14} /> Past research stays attached to this conversation</span>
-                {isStreaming ? (
-                  <button type="button" className="send-button stop-button" onClick={() => abortRef.current?.abort()} aria-label="Stop response"><Icon name="stop" size={17} /></button>
-                ) : (
-                  <button type="submit" className="send-button" disabled={!input.trim()} aria-label="Send question"><Icon name="send" size={17} /></button>
-                )}
-              </div>
-            </form>
-            <p className="composer-disclaimer">Minimi can make mistakes. Check important details against the linked sources.</p>
-          </div>
+          {messages.length > 0 && composer}
         </section>
       </main>
     </div>

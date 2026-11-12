@@ -144,6 +144,72 @@ describe("structured research persistence", () => {
     expect(result.rows[0]?.topic).toBe("Restart persistence");
   });
 
+  it("retrieves matching messages across conversations for one owner only", async () => {
+    const { LOCAL_USER_ID, searchUserMessages, saveMessage } = await import("../src/lib/db");
+    await saveMessage("global-memory-a", "user", "MetaCrossTest discussed open-weight model strategy", LOCAL_USER_ID);
+    await saveMessage("global-memory-a", "assistant", "MetaCrossTest chose an open-weight strategy", LOCAL_USER_ID);
+    await memory.db.execute({ sql: "UPDATE messages SET created_at = ? WHERE conversation_id = ?", args: ["2026-11-12 21:17:03", "global-memory-a"] });
+    await memory.db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: ["isolated-test-user"] });
+    await saveMessage("global-memory-b", "user", "MetaCrossTest unrelated private discussion", "isolated-test-user");
+
+    const sameOwner = await searchUserMessages({ userId: LOCAL_USER_ID, query: "MetaCrossTest", limit: 20 });
+    const otherOwner = await searchUserMessages({ userId: "isolated-test-user", query: "MetaCrossTest", limit: 20 });
+
+    expect(sameOwner.map((row) => row.conversation_id)).toContain("global-memory-a");
+    expect(sameOwner.map((row) => row.conversation_id)).not.toContain("global-memory-b");
+    expect(otherOwner.map((row) => row.conversation_id)).toEqual(["global-memory-b"]);
+    const { dateWindowUtc, parseRecallDate, localDateParts, sameDate } = await import("../src/agent/history-recall");
+    const requestedDate = parseRecallDate("what we discussed about Meta on 13th nov", "Asia/Kolkata", new Date("2026-11-13T00:00:00Z"))!;
+    const matchingDay = sameOwner.filter((row) => sameDate(localDateParts(String(row.created_at), "Asia/Kolkata"), requestedDate));
+    const dayRows = await searchUserMessages({ userId: LOCAL_USER_ID, query: "MetaCrossTest", ...dateWindowUtc(requestedDate) });
+    expect(matchingDay.length).toBeGreaterThan(0);
+    expect(dayRows.map((row) => row.conversation_id)).toContain("global-memory-a");
+  });
+
+  it("stores and retrieves durable memory by owner without duplicate summaries", async () => {
+    const { LOCAL_USER_ID, saveMemoryItem, findRelevantMemoryItems } = await import("../src/lib/db");
+    const input = { userId: LOCAL_USER_ID, conversationId: "durable-memory", memoryType: "important_discussions", content: "Discussed the Meta open-weight strategy.", summary: "Meta open-weight strategy" };
+    const first = await saveMemoryItem(input);
+    const second = await saveMemoryItem(input);
+    const found = await findRelevantMemoryItems(LOCAL_USER_ID, "What about Meta open-weight strategy?");
+    const isolated = await findRelevantMemoryItems("isolated-test-user", "Meta open-weight strategy");
+
+    expect(first).toBe(second);
+    expect(found.map((row) => row.id)).toContain(first);
+    expect(isolated).toEqual([]);
+  });
+
+  it("retrieves historical observations across conversations but keeps them user-scoped", async () => {
+    const { LOCAL_USER_ID } = await import("../src/lib/db");
+    const first = await memory.saveResearchSession({
+      conversationId: "global-research-a",
+      userId: LOCAL_USER_ID,
+      topic: "GlobalNeonTest pricing",
+      summary: "Recorded old plan price.",
+      researchedAt: "2026-11-03T10:00:00.000Z",
+    });
+    await memory.saveObservations(first.id, [{
+      entity: { name: "GlobalNeonTest", type: "company" },
+      source: { url: "https://global-neon.example/pricing", title: "Historical pricing" },
+      attribute: "Pro plan price",
+      value: "$19",
+    }], first.researchedAt);
+    await memory.db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: ["research-isolated-user"] });
+    await memory.saveResearchSession({
+      conversationId: "global-research-b",
+      userId: "research-isolated-user",
+      topic: "GlobalNeonTest private pricing",
+      summary: "Private other-user session.",
+      researchedAt: "2026-11-04T10:00:00.000Z",
+    });
+
+    const { findRelevantResearch } = await import("../src/agent/research-memory");
+    const ownerHistory = await findRelevantResearch(LOCAL_USER_ID, "GlobalNeonTest price", "today", true);
+    const otherHistory = await findRelevantResearch("research-isolated-user", "GlobalNeonTest private price", "today", true);
+    expect(ownerHistory.flatMap((session) => session.observations).map((item) => item.value)).toContain("$19");
+    expect(otherHistory.flatMap((session) => session.observations).map((item) => item.value)).not.toContain("$19");
+  });
+
   it("rejects observations with missing foreign-key parents", async () => {
     await expect(memory.db.execute({
       sql: `INSERT INTO observations
@@ -175,6 +241,16 @@ describe("structured research persistence", () => {
 });
 
 describe("evidence validation and comparison outcomes", () => {
+  it("parses ordinal day-first dates and handles UTC messages in the user's local day", async () => {
+    const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, isHistoryRecallQuestion } = await import("../src/agent/history-recall");
+    const date = parseRecallDate("what we discussed about Meta on 13th nov", "Asia/Kolkata", new Date("2026-11-13T00:00:00Z"));
+
+    expect(date).toEqual({ year: 2026, month: 10, day: 13 });
+    expect(sameDate(localDateParts("2026-11-12 21:17:03", "Asia/Kolkata"), date!)).toBe(true);
+    expect(dateWindowUtc(date!)).toEqual({ startUtc: "2026-11-12 00:00:00", endUtc: "2026-11-15 00:00:00" });
+    expect(isHistoryRecallQuestion("what we discussed about the meta on 13th nov")).toBe(true);
+  });
+
   it("discards invalid extraction output and unsupported source claims", async () => {
     const { filterSupportedObservations } = await import("../src/agent/research-memory");
     const hit = {
