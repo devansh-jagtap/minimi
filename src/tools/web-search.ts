@@ -99,10 +99,26 @@ export const webSearch = tool({
   execute: async ({ queries }): Promise<SearchResult[]> => {
     const uniqueQueries = [...new Set(queries)];
 
+    console.info(
+      `[Minimi] Tavily started: ${uniqueQueries.length} queries`
+    );
     const results = await Promise.allSettled(
       uniqueQueries.map(searchTavily)
     );
 
+    const successful = results.filter(
+      (result) => result.status === "fulfilled"
+    ).length;
+
+    const totalResults = results.reduce(
+      (count, result) =>
+        count + (result.status === "fulfilled" ? result.value.length : 0),
+      0
+    );
+
+    console.info(
+      `[Minimi] Tavily completed: ${successful}/${uniqueQueries.length} successful searches, ${totalResults} results`
+    );
     const output: SearchResult[] = [];
 
     results.forEach((result, index) => {

@@ -10,7 +10,6 @@ import {
   getRecentMessages,
 } from "@/lib/db";
 
-export const runtime = "nodejs";
 
 const RequestSchema = z.object({
   message: z.string().trim().min(1).max(10000),
