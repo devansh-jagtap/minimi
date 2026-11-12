@@ -1,6 +1,5 @@
 
 import { randomUUID } from "node:crypto";
-import type { ModelMessage } from "ai";
 import { z } from "zod";
 
 import { runResearchAgent } from "@/agent/orchestrator";
@@ -19,6 +18,7 @@ const RequestSchema = z.object({
 });
 
 export async function POST(request: Request) {
+  const requestStartedAt = Date.now();
   try {
     const body = RequestSchema.parse(await request.json());
 
@@ -57,18 +57,24 @@ export async function POST(request: Request) {
       .map((message) => message.content)
       .join("\n");
     let historicalContext: string | undefined;
+    const retrievalStartedAt = Date.now();
     try {
-      const priorResearch = await findRelevantResearch(conversationId, retrievalQuery);
+      const priorResearch = await findRelevantResearch(conversationId, retrievalQuery, body.message);
       if (priorResearch.length) historicalContext = JSON.stringify(priorResearch);
     } catch (error) {
       console.error("[Minimi] Historical research retrieval failed:", error);
     }
+    console.info(`[Minimi] Memory retrieval completed in ${Date.now() - retrievalStartedAt}ms`);
 
     // Run the agent and persist its final response.
     const searchHits: SearchHit[] = [];
+    let modelCallCount = 0;
+    let searchCallCount = 0;
     const result = runResearchAgent(messages, {
       abortSignal: request.signal,
       onSearchResults: (hits) => searchHits.push(...hits),
+      onSearchCall: (count) => { searchCallCount += count; },
+      onModelStep: () => { modelCallCount += 1; },
       historicalContext,
       onFinish: async (text) => {
         await saveMessage(
@@ -87,6 +93,7 @@ export async function POST(request: Request) {
         } catch (error) {
           console.error("[Minimi] Research memory extraction failed:", error);
         }
+        console.info(`[Minimi] Request completed in ${Date.now() - requestStartedAt}ms; chat model steps ${modelCallCount}; extraction call ${searchHits.length ? "attempted" : "skipped"}; Tavily queries ${searchCallCount}`);
       },
     });
 
