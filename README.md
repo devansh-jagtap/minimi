@@ -18,7 +18,7 @@ bun run build
 bun run start
 ```
 
-The build script uses Next.js's webpack build mode. In this repository's installed Next.js 16.4.6 environment, the default Turbopack build exits while starting its CSS worker; webpack completed the production build successfully.
+The build script uses Next.js's webpack build mode because the default Turbopack build exits while starting its CSS worker in this environment. Here, webpack compilation and type checking succeed, but static page generation can still hit a Windows `EPERM` while writing parallel `.next` output under OneDrive. A clean local filesystem may avoid that workspace-specific build error.
 
 ## Memory lifecycle
 
