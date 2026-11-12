@@ -173,10 +173,19 @@ describe("structured research persistence", () => {
     const second = await saveMemoryItem(input);
     const found = await findRelevantMemoryItems(LOCAL_USER_ID, "What about Meta open-weight strategy?");
     const isolated = await findRelevantMemoryItems("isolated-test-user", "Meta open-weight strategy");
+    const unrelated = await findRelevantMemoryItems(LOCAL_USER_ID, "How tall is Mount Everest?");
+    const restartedClient = createClient({ url: databaseUrl });
+    const persisted = await restartedClient.execute({
+      sql: "SELECT id FROM memory_items WHERE user_id = ? AND id = ?",
+      args: [LOCAL_USER_ID, first],
+    });
+    restartedClient.close();
 
     expect(first).toBe(second);
     expect(found.map((row) => row.id)).toContain(first);
     expect(isolated).toEqual([]);
+    expect(unrelated).toEqual([]);
+    expect(persisted.rows[0]?.id).toBe(first);
   });
 
   it("retrieves historical observations across conversations but keeps them user-scoped", async () => {
