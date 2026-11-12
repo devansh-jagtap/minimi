@@ -4,6 +4,8 @@ import type { ModelMessage } from "ai";
 import { z } from "zod";
 
 import { runResearchAgent } from "@/agent/orchestrator";
+import { recordResearch } from "@/agent/research-memory";
+import type { SearchHit } from "@/tools/web-search";
 import {
   ensureSchema,
   saveMessage,
@@ -50,14 +52,27 @@ export async function POST(request: Request) {
 }));
 
     // Run the agent and persist its final response.
+    const searchHits: SearchHit[] = [];
     const result = runResearchAgent(messages, {
       abortSignal: request.signal,
+      onSearchResults: (hits) => searchHits.push(...hits),
       onFinish: async (text) => {
         await saveMessage(
           conversationId,
           "assistant",
           text
         );
+        try {
+          await recordResearch({
+            conversationId,
+            question: body.message,
+            answer: text,
+            searchHits,
+            abortSignal: AbortSignal.timeout(12000),
+          });
+        } catch (error) {
+          console.error("[Minimi] Research memory extraction failed:", error);
+        }
       },
     });
 
