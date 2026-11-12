@@ -8,6 +8,18 @@ export function isHistoryRecallQuestion(query: string) {
     && /\b(on|about|from|last|previous|past|earlier)\b/i.test(query);
 }
 
+export function historyRecallTopic(query: string) {
+  const monthPattern = MONTHS.map((month) => `${month.slice(0, 3)}(?:${month.slice(3)})?`).join("|");
+  return query
+    .replace(/\b20\d{2}-\d{1,2}-\d{1,2}\b/g, " ")
+    .replace(new RegExp(`\\b(?:${monthPattern})\\b`, "gi"), " ")
+    .replace(/\b\d{1,2}(?:st|nd|rd|th)?\b/g, " ")
+    .replace(/\b(what|which|did|do|i|we|you|me|my|our|the|a|an|on|in|at|from|about|previously|earlier|last|conversation|chat|discussed|discussion|talked|asked|ask|remember|recall|tell|remind)\b/gi, " ")
+    .replace(/[^a-z0-9.+#-]+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function parseRecallDate(query: string, timeZone: string, now = new Date()): CalendarDate | null {
   const iso = query.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
   if (iso) return { year: Number(iso[1]), month: Number(iso[2]) - 1, day: Number(iso[3]) };
