@@ -8,7 +8,7 @@ if (!url) {
   throw new Error("DATABASE_URL is missing");
 }
 
-export const db = createClient({ url });
+export const db = createClient({ url, concurrency: 1 });
 
 export type ResearchSession = {
   id: string;
@@ -45,10 +45,24 @@ export type StoredObservation = ResearchObservation & {
 };
 
 let schemaPromise: Promise<void> | undefined;
+let writeQueue: Promise<void> = Promise.resolve();
+
+async function withWriteLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = writeQueue;
+  let release!: () => void;
+  writeQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
 
 export function ensureSchema() {
   if (!schemaPromise) {
     schemaPromise = (async () => {
+      await db.execute("PRAGMA foreign_keys = ON");
       await db.batch(
         [
           `CREATE TABLE IF NOT EXISTS conversations (
@@ -132,17 +146,18 @@ export async function saveMessage(
   content: string
 ) {
   await ensureSchema();
+  await withWriteLock(async () => {
+    await db.execute({
+      sql: `INSERT OR IGNORE INTO conversations (id) VALUES (?)`,
+      args: [conversationId],
+    });
 
-  await db.execute({
-    sql: `INSERT OR IGNORE INTO conversations (id) VALUES (?)`,
-    args: [conversationId],
-  });
-
-  await db.execute({
-    sql: `INSERT INTO messages
-      (conversation_id, role, content)
-      VALUES (?, ?, ?)`,
-    args: [conversationId, role, content],
+    await db.execute({
+      sql: `INSERT INTO messages
+        (conversation_id, role, content)
+        VALUES (?, ?, ?)`,
+      args: [conversationId, role, content],
+    });
   });
 }
 
@@ -169,11 +184,13 @@ const normalizeEntityName = (name: string) => name.trim().toLocaleLowerCase("en-
 export async function saveResearchSession(input: Omit<ResearchSession, "id"> & { id?: string }) {
   await ensureSchema();
   const id = input.id ?? randomUUID();
-  await db.execute({ sql: "INSERT OR IGNORE INTO conversations (id) VALUES (?)", args: [input.conversationId] });
-  await db.execute({
-    sql: `INSERT INTO research_sessions (id, conversation_id, topic, summary, researched_at)
-          VALUES (?, ?, ?, ?, ?)`,
-    args: [id, input.conversationId, input.topic, input.summary, input.researchedAt],
+  await withWriteLock(async () => {
+    await db.execute({ sql: "INSERT OR IGNORE INTO conversations (id) VALUES (?)", args: [input.conversationId] });
+    await db.execute({
+      sql: `INSERT INTO research_sessions (id, conversation_id, topic, summary, researched_at)
+            VALUES (?, ?, ?, ?, ?)`,
+      args: [id, input.conversationId, input.topic, input.summary, input.researchedAt],
+    });
   });
   return { ...input, id };
 }
@@ -279,43 +296,52 @@ export async function saveObservations(
 ) {
   await ensureSchema();
   const saved: StoredObservation[] = [];
-  for (const observation of observations) {
-    const entityId = randomUUID();
-    await db.execute({
-      sql: `INSERT INTO entities (id, normalized_name, display_name, entity_type)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(normalized_name) DO UPDATE SET
-              display_name = excluded.display_name, entity_type = excluded.entity_type`,
-      args: [entityId, normalizeEntityName(observation.entity.name), observation.entity.name.trim(), observation.entity.type],
-    });
-    const entity = await db.execute({
-      sql: "SELECT id FROM entities WHERE normalized_name = ?",
-      args: [normalizeEntityName(observation.entity.name)],
-    });
-    const resolvedEntityId = String(entity.rows[0].id);
+  await withWriteLock(async () => {
+    const transaction = await db.transaction("write");
+    try {
+      for (const observation of observations) {
+        const entityId = randomUUID();
+        await transaction.execute({
+          sql: `INSERT INTO entities (id, normalized_name, display_name, entity_type)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(normalized_name) DO UPDATE SET
+                  display_name = excluded.display_name, entity_type = excluded.entity_type`,
+          args: [entityId, normalizeEntityName(observation.entity.name), observation.entity.name.trim(), observation.entity.type],
+        });
+        const entity = await transaction.execute({
+          sql: "SELECT id FROM entities WHERE normalized_name = ?",
+          args: [normalizeEntityName(observation.entity.name)],
+        });
+        const resolvedEntityId = String(entity.rows[0].id);
 
-    const sourceId = randomUUID();
-    const retrievedAt = observedAt;
-    await db.execute({
-      sql: `INSERT INTO sources (id, url, title, publisher, published_at, retrieved_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url) DO UPDATE SET
-              title = excluded.title, publisher = COALESCE(excluded.publisher, sources.publisher),
-              published_at = COALESCE(excluded.published_at, sources.published_at),
-              retrieved_at = excluded.retrieved_at`,
-      args: [sourceId, observation.source.url, observation.source.title, observation.source.publisher ?? null, observation.source.publishedAt ?? null, retrievedAt],
-    });
-    const source = await db.execute({ sql: "SELECT id FROM sources WHERE url = ?", args: [observation.source.url] });
-    const resolvedSourceId = String(source.rows[0].id);
-    const id = randomUUID();
-    await db.execute({
-      sql: `INSERT INTO observations
-            (id, research_session_id, entity_id, source_id, attribute, value, observed_at, valid_from)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [id, researchSessionId, resolvedEntityId, resolvedSourceId, observation.attribute, observation.value, observedAt, observation.validFrom ?? null],
-    });
-    saved.push({ ...observation, id, researchSessionId, entityId: resolvedEntityId, sourceId: resolvedSourceId, observedAt, retrievedAt });
-  }
+        const sourceId = randomUUID();
+        const retrievedAt = observedAt;
+        await transaction.execute({
+          sql: `INSERT INTO sources (id, url, title, publisher, published_at, retrieved_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                  title = excluded.title, publisher = COALESCE(excluded.publisher, sources.publisher),
+                  published_at = COALESCE(excluded.published_at, sources.published_at),
+                  retrieved_at = excluded.retrieved_at`,
+          args: [sourceId, observation.source.url, observation.source.title, observation.source.publisher ?? null, observation.source.publishedAt ?? null, retrievedAt],
+        });
+        const source = await transaction.execute({ sql: "SELECT id FROM sources WHERE url = ?", args: [observation.source.url] });
+        const resolvedSourceId = String(source.rows[0].id);
+        const id = randomUUID();
+        await transaction.execute({
+          sql: `INSERT INTO observations
+                (id, research_session_id, entity_id, source_id, attribute, value, observed_at, valid_from)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [id, researchSessionId, resolvedEntityId, resolvedSourceId, observation.attribute, observation.value, observedAt, observation.validFrom ?? null],
+        });
+        saved.push({ ...observation, id, researchSessionId, entityId: resolvedEntityId, sourceId: resolvedSourceId, observedAt, retrievedAt });
+      }
+      await transaction.commit();
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+  });
   return saved;
 }
 
