@@ -51,7 +51,7 @@ function event(data: Record<string, unknown>) {
 }
 
 function formatRequestedDate(date: { year: number; month: number; day: number }, timeZone: string) {
-  return new Intl.DateTimeFormat("en-US", { dateStyle: "long", timeZone }).format(new Date(Date.UTC(date.year, date.month, date.day)));
+  return new Intl.DateTimeFormat("en-US", { dateStyle: "long", timeZone }).format(new Date(Date.UTC(date.year, date.month, date.day, 12)));
 }
 
 function cleanRecalledAnswer(answer: string) {
@@ -81,7 +81,7 @@ export async function POST(request: Request) {
     const recallRequested = isHistoryRecallQuestion(body.message);
     let recallRows: Awaited<ReturnType<typeof searchUserMessages>> = [];
     if (recallRequested) {
-      const dateWindow = requestedDate ? dateWindowUtc(requestedDate) : {};
+      const dateWindow = requestedDate ? dateWindowUtc(requestedDate, timeZone) : {};
       const queryTopic = historyRecallTopic(body.message);
       recallRows = await searchUserMessages({ userId, query: requestedDate ? "" : queryTopic || body.message, ...dateWindow, limit: requestedDate ? 100 : 40 });
       if (requestedDate) recallRows = recallRows.filter((row) => sameDate(localDateParts(String(row.created_at), timeZone), requestedDate));
@@ -124,7 +124,7 @@ export async function POST(request: Request) {
     let historicalContext: string | undefined;
     const retrievalStartedAt = Date.now();
     try {
-      const priorResearch = await findRelevantResearch(userId, retrievalQuery, body.message, true);
+      const priorResearch = await findRelevantResearch(userId, retrievalQuery, body.message, true, timeZone);
       const priorMemories = await findRelevantMemoryItems(userId, body.message);
       if (priorResearch.length || priorMemories.length) {
         historicalContext = JSON.stringify({ storedEvidence: priorResearch, durableMemories: priorMemories });
