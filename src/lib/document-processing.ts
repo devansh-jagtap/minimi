@@ -360,8 +360,9 @@ export async function retrieveDocumentContext(
     sql: `SELECT c.id, c.document_id, c.content, c.page_number, c.section_heading, c.embedding_json,
                  d.filename, d.user_id AS document_user_id, d.conversation_id
           FROM document_chunks c JOIN documents d ON d.id = c.document_id
-          WHERE c.user_id = ? AND d.user_id = ? AND d.conversation_id = ? AND d.status = 'completed'
-          ORDER BY c.chunk_index ASC LIMIT ?`,
+          WHERE c.user_id = ? AND d.user_id = ? AND d.status = 'completed'
+          ORDER BY CASE WHEN d.conversation_id = ? THEN 0 ELSE 1 END, d.created_at DESC, c.chunk_index ASC
+          LIMIT ?`,
     args: [userId, userId, conversationId, MAX_CANDIDATE_CHUNKS],
   });
   if (!rows.rows.length) return { context: "", citations: [] };
@@ -401,11 +402,12 @@ export async function retrieveDocumentContext(
   for (const item of ranked) {
     if (citations.length >= Math.min(options.maxChunks ?? MAX_CONTEXT_CHUNKS, 10)) break;
     const filename = String(item.row.filename);
+    const sourceConversationId = String(item.row.conversation_id);
     const pageNumber = item.row.page_number == null ? undefined : Number(item.row.page_number);
     const sectionHeading = item.row.section_heading == null ? undefined : String(item.row.section_heading);
     const citation = { documentId: String(item.row.document_id), filename, pageNumber, sectionHeading };
     const excerpt = item.content.slice(0, 1800);
-    const sourceLabel = [filename, pageNumber ? `page ${pageNumber}` : undefined, sectionHeading].filter(Boolean).join(" · ");
+    const sourceLabel = [filename, sourceConversationId !== conversationId ? "from another chat" : undefined, pageNumber ? `page ${pageNumber}` : undefined, sectionHeading].filter(Boolean).join(" · ");
     const part = `[Untrusted document excerpt: ${sourceLabel}]\n${excerpt}`;
     if (usedChars + part.length > Math.min(options.maxChars ?? MAX_CONTEXT_CHARS, MAX_CONTEXT_CHARS)) continue;
     contextParts.push(part);
