@@ -2,7 +2,7 @@
 import { streamText, isStepCount } from "ai";
 
 import { model } from "@/lib/ai";
-import { webSearch } from "@/tools/web-search";
+import { createWebSearchTool, type SearchHit } from "@/tools/web-search";
 import { SYSTEM_PROMPT } from "./system-prompt";
 
 export function runResearchAgent(
@@ -12,6 +12,7 @@ export function runResearchAgent(
   }>,
   options?: {
     abortSignal?: AbortSignal;
+    onSearchResults?: (hits: SearchHit[]) => void;
     onFinish?: (text: string) => Promise<void>;
   }
 ) {
@@ -19,7 +20,7 @@ export function runResearchAgent(
     model,
     system: SYSTEM_PROMPT,
     messages,
-    tools: { webSearch },
+    tools: { webSearch: createWebSearchTool(options?.onSearchResults) },
 
     stopWhen: isStepCount(4),
     maxRetries: 1,
