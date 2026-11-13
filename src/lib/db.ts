@@ -165,6 +165,43 @@ export function ensureSchema() {
             FOREIGN KEY (entity_id) REFERENCES entities(id),
             FOREIGN KEY (source_id) REFERENCES sources(id)
           )`,
+          `CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            object_key TEXT NOT NULL UNIQUE,
+            filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            content_sha256 TEXT,
+            status TEXT NOT NULL DEFAULT 'uploaded' CHECK (status IN ('uploaded','queued','processing','completed','failed')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            lease_until TEXT,
+            error_message TEXT,
+            parser_version TEXT,
+            embedding_model TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+          )`,
+          `CREATE TABLE IF NOT EXISTS document_chunks (
+            id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            page_number INTEGER,
+            section_heading TEXT,
+            content_hash TEXT NOT NULL,
+            embedding_json TEXT,
+            embedding_model TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(document_id, chunk_index),
+            FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+          )`,
+          `CREATE INDEX IF NOT EXISTS idx_documents_owner_status ON documents(user_id, status, created_at DESC)`,
+          `CREATE INDEX IF NOT EXISTS idx_documents_conversation ON documents(user_id, conversation_id, created_at DESC)`,
+          `CREATE INDEX IF NOT EXISTS idx_document_chunks_owner_document ON document_chunks(user_id, document_id, chunk_index)`,
           `CREATE INDEX IF NOT EXISTS idx_observations_entity_attribute
             ON observations(entity_id, attribute, observed_at DESC)`,
           `CREATE INDEX IF NOT EXISTS idx_observations_session
