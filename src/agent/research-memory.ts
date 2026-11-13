@@ -10,6 +10,7 @@ import {
   type ResearchObservation,
 } from "@/lib/db";
 import type { SearchHit } from "@/tools/web-search";
+import { localDateParts, parseRecallDate, sameDate } from "@/agent/history-recall";
 
 const ExtractionSchema = z.object({
   observations: z.array(z.object({
@@ -20,8 +21,74 @@ const ExtractionSchema = z.object({
     sourceUrl: z.string().url(),
     evidenceQuote: z.string().min(15).max(600),
     validFrom: z.string().date().optional(),
+    comparison: z.object({
+      planTier: z.string().min(1).max(100).optional(),
+      currency: z.string().min(1).max(8).optional(),
+      billingInterval: z.string().min(1).max(40).optional(),
+      priceBasis: z.string().min(1).max(100).optional(),
+      region: z.string().min(1).max(100).optional(),
+    }).optional(),
   })).max(12),
 });
+
+function normalizedText(value: string) {
+  return value.toLocaleLowerCase("en-US").replace(/[^a-z0-9.]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function currencyCode(value: string) {
+  const text = value.toLocaleUpperCase("en-US");
+  if (/\bUSD\b|\$/.test(text)) return "USD";
+  if (/\bEUR\b|€/.test(text)) return "EUR";
+  if (/\bGBP\b|£/.test(text)) return "GBP";
+  if (/\bCAD\b/.test(text)) return "CAD";
+  if (/\bAUD\b/.test(text)) return "AUD";
+  if (/\bINR\b|₹/.test(text)) return "INR";
+  if (/\bJPY\b|¥/.test(text)) return "JPY";
+  return undefined;
+}
+
+function amountValues(value: string) {
+  return [...value.matchAll(/(?:\b\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g)].map((match) => Number(match[0].replaceAll(",", "")));
+}
+
+function canonicalPriceUnits(value: string) {
+  const text = normalizedText(value);
+  const units: string[] = [];
+  if (/\b(per\s+)?user\b/.test(text)) units.push("user");
+  if (/\b(per\s+)?seat\b/.test(text)) units.push("seat");
+  if (/\b(per\s+)?month(ly)?\b/.test(text)) units.push("month");
+  if (/\b(per\s+)?year(ly|annually)?\b|\bannual(ly)?\b/.test(text)) units.push("year");
+  if (/\b(per\s+)?account\b/.test(text)) units.push("account");
+  if (/\b(per\s+)?organization\b/.test(text)) units.push("organization");
+  return units.sort().join("/");
+}
+
+function valueSupportedByQuote(value: string, quote: string) {
+  const amounts = amountValues(value);
+  if (amounts.length) {
+    const quoteAmounts = amountValues(quote);
+    if (amounts.some((amount) => !quoteAmounts.includes(amount))) return false;
+    const claimedCurrency = currencyCode(value);
+    if (claimedCurrency && currencyCode(quote) !== claimedCurrency) return false;
+    const claimedUnits = canonicalPriceUnits(value);
+    return !claimedUnits || canonicalPriceUnits(quote) === claimedUnits;
+  }
+  const normalizedValue = normalizedText(value);
+  return normalizedValue.length >= 3 && normalizedText(quote).includes(normalizedValue);
+}
+
+function quoteSupportsDate(quote: string, validFrom: string) {
+  const [year, month, day] = validFrom.split("-").map(Number);
+  if (quote.includes(validFrom)) return true;
+  const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+  const monthName = months[month - 1];
+  const escapedMonth = monthName.slice(0, 3) + `(?:${monthName.slice(3)})?`;
+  const patterns = [
+    new RegExp(`\\b${escapedMonth}\\s+${day}(?:st|nd|rd|th)?(?:,?\\s+${year})?\\b`, "i"),
+    new RegExp(`\\b${day}(?:st|nd|rd|th)?\\s+${escapedMonth}(?:\\s+${year})?\\b`, "i"),
+  ];
+  return patterns.some((pattern) => pattern.test(quote));
+}
 
 export function filterSupportedObservations(raw: unknown, hits: SearchHit[]): ResearchObservation[] {
   const parsed = ExtractionSchema.safeParse(raw);
@@ -38,7 +105,8 @@ export function filterSupportedObservations(raw: unknown, hits: SearchHit[]): Re
     const source = (hitsByUrl.get(item.sourceUrl) ?? []).find((hit) =>
       hit.content.toLocaleLowerCase("en-US").includes(item.evidenceQuote.trim().toLocaleLowerCase("en-US")),
     );
-    if (!source || (item.validFrom && !item.evidenceQuote.includes(item.validFrom))) return [];
+    if (!source || !valueSupportedByQuote(item.value, item.evidenceQuote)) return [];
+    if (item.validFrom && !quoteSupportsDate(item.evidenceQuote, item.validFrom)) return [];
 
     let publisher: string;
     try {
@@ -53,6 +121,7 @@ export function filterSupportedObservations(raw: unknown, hits: SearchHit[]): Re
       attribute: item.attribute,
       value: item.value,
       validFrom: item.validFrom,
+      comparison: item.comparison,
     }];
   });
 }
@@ -60,13 +129,27 @@ export function filterSupportedObservations(raw: unknown, hits: SearchHit[]): Re
 export type ComparisonStatus = "confirmed change" | "no change found in available evidence" | "insufficient evidence";
 
 export function classifyObservationComparison(
-  historical?: { entity: string; attribute: string; value: string; sourceUrl: string },
-  current?: { entity: string; attribute: string; value: string; sourceUrl: string },
+  historical?: { entity: string; attribute: string; value: string; sourceUrl: string; comparison?: ResearchObservation["comparison"] },
+  current?: { entity: string; attribute: string; value: string; sourceUrl: string; comparison?: ResearchObservation["comparison"] },
 ): ComparisonStatus {
   if (!historical || !current || !historical.sourceUrl || !current.sourceUrl) return "insufficient evidence";
   const sameEntity = historical.entity.trim().toLocaleLowerCase("en-US") === current.entity.trim().toLocaleLowerCase("en-US");
   const sameAttribute = historical.attribute.trim().toLocaleLowerCase("en-US") === current.attribute.trim().toLocaleLowerCase("en-US");
   if (!sameEntity || !sameAttribute) return "insufficient evidence";
+  const priceLike = /price|cost|\$|€|£|₹|\b(?:usd|eur|gbp|cad|aud|inr)\b/i.test(`${historical.attribute} ${current.attribute} ${historical.value} ${current.value}`);
+  if (priceLike) {
+    const requiredDimensions: Array<keyof NonNullable<ResearchObservation["comparison"]>> = ["planTier", "currency", "billingInterval", "priceBasis", "region"];
+    for (const dimension of requiredDimensions) {
+      const oldValue = historical.comparison?.[dimension]?.trim().toLocaleLowerCase("en-US");
+      const newValue = current.comparison?.[dimension]?.trim().toLocaleLowerCase("en-US");
+      if (!oldValue || !newValue || oldValue !== newValue) return "insufficient evidence";
+    }
+    const oldCurrency = currencyCode(historical.value);
+    const newCurrency = currencyCode(current.value);
+    const oldAmount = amountValues(historical.value);
+    const newAmount = amountValues(current.value);
+    if (!oldAmount.length || !newAmount.length || oldCurrency !== newCurrency || oldAmount.length !== 1 || newAmount.length !== 1) return "insufficient evidence";
+  }
   const normalizeValue = (value: string) => value.trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
   return normalizeValue(historical.value) === normalizeValue(current.value)
     ? "no change found in available evidence"
@@ -86,38 +169,12 @@ const terms = (value: string) => new Set(
     .filter((term) => term.length > 1 && !STOP_WORDS.has(term)),
 );
 
-function temporalMatch(query: string, timestamp: string) {
-  const observed = new Date(timestamp);
-  if (Number.isNaN(observed.getTime())) return false;
-  const queryLower = query.toLocaleLowerCase("en-US");
-  const observedDay = observed.getUTCDate();
-  const observedMonth = observed.getUTCMonth();
-  const observedYear = observed.getUTCFullYear();
-  const monthNames = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
-
-  const iso = queryLower.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
-  if (iso) return observedYear === Number(iso[1]) && observedMonth === Number(iso[2]) - 1 && observedDay === Number(iso[3]);
-
-  const date = queryLower.match(/\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+(20\d{2}))?\b/);
-  if (date) {
-    const month = monthNames.indexOf(date[2]);
-    return observedDay === Number(date[1]) && observedMonth === month && (!date[3] || observedYear === Number(date[3]));
-  }
-
-  const weekdayIndex = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
-    .findIndex((day) => new RegExp(`\\b${day}\\b`).test(queryLower));
-  if (weekdayIndex < 0) return false;
-  const now = new Date();
-  const latest = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  const daysBack = (latest.getUTCDay() - weekdayIndex + 7) % 7 || 7;
-  latest.setUTCDate(latest.getUTCDate() - daysBack);
-  const lastWeek = new Date(latest);
-  lastWeek.setUTCDate(latest.getUTCDate() - 7);
-  const observedDate = Date.UTC(observedYear, observedMonth, observedDay);
-  return observedDate === latest.getTime() || observedDate === lastWeek.getTime();
+export function temporalMatch(query: string, timestamp: string, timeZone = "UTC", now = new Date()) {
+  const requestedDate = parseRecallDate(query, timeZone, now);
+  return requestedDate ? sameDate(localDateParts(timestamp, timeZone), requestedDate) : false;
 }
 
-export async function findRelevantResearch(ownerId: string, query: string, temporalQuery = query, globalUserScope = false) {
+export async function findRelevantResearch(ownerId: string, query: string, temporalQuery = query, globalUserScope = false, timeZone = "UTC") {
   const sessions = await findResearchSessions(globalUserScope ? { userId: ownerId, limit: 50 } : { conversationId: ownerId, limit: 50 });
   if (!sessions.length) return [];
 
@@ -134,7 +191,7 @@ export async function findRelevantResearch(ownerId: string, query: string, tempo
     );
     const topicTerms = terms(`${String(session.topic)} ${String(session.summary)}`);
     const topicMatches = [...queryTerms].filter((term) => topicTerms.has(term));
-    const isDateMatch = temporalMatch(temporalQuery, String(session.researched_at));
+    const isDateMatch = temporalMatch(temporalQuery, String(session.researched_at), timeZone);
     return { session, sessionObservations, entityMatches, topicMatches, isDateMatch, score: entityMatches.length * 3 + topicMatches.length + (isDateMatch ? 10 : 0) };
   }).filter((item) => item.isDateMatch || item.entityMatches.length > 0 || item.topicMatches.length >= 2)
     .sort((a, b) => b.score - a.score || String(b.session.researched_at).localeCompare(String(a.session.researched_at)))
@@ -153,6 +210,13 @@ export async function findRelevantResearch(ownerId: string, query: string, tempo
       value: String(observation.value),
       observedAt: String(observation.observed_at),
       validFrom: observation.valid_from ? String(observation.valid_from) : undefined,
+      comparison: {
+        planTier: observation.plan_tier ? String(observation.plan_tier) : undefined,
+        currency: observation.currency ? String(observation.currency) : undefined,
+        billingInterval: observation.billing_interval ? String(observation.billing_interval) : undefined,
+        priceBasis: observation.price_basis ? String(observation.price_basis) : undefined,
+        region: observation.region ? String(observation.region) : undefined,
+      },
       source: {
         title: String(observation.title),
         url: String(observation.url),
@@ -194,7 +258,7 @@ export async function recordResearch(input: {
     schemaName: "evidence_backed_research_observations",
     abortSignal: input.abortSignal,
     maxOutputTokens: 1800,
-    prompt: `Extract up to 12 durable facts relevant to the user's research question. Use only the supplied search evidence. Never infer facts from the assistant answer. Each observation must include an exact verbatim evidenceQuote found in that source's content, and sourceUrl must exactly match a supplied URL. Capture pricing, plan limits, features, and dated releases where explicitly supported. Only set validFrom when the evidence quote itself states that effective date; otherwise omit it. Return an empty list when no verifiable facts are present.
+    prompt: `Extract up to 12 durable facts relevant to the user's research question. Use only the supplied search evidence. Never infer facts from the assistant answer. Each observation must include an exact verbatim evidenceQuote found in that source's content, and sourceUrl must exactly match a supplied URL. Capture pricing, plan limits, features, and dated releases where explicitly supported. For prices, also extract comparison metadata only when the evidence explicitly supports it: planTier, currency, billingInterval, priceBasis (for example per user, per seat, or per account), and region. Leave unknown dimensions out; never infer them. Only set validFrom when the evidence quote itself states that effective date; otherwise omit it. Return an empty list when no verifiable facts are present.
 
 Question: ${input.question.slice(0, 2000)}
 

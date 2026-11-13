@@ -33,6 +33,13 @@ export type ResearchObservation = {
   attribute: string;
   value: string;
   validFrom?: string;
+  comparison?: {
+    planTier?: string;
+    currency?: string;
+    billingInterval?: string;
+    priceBasis?: string;
+    region?: string;
+  };
 };
 
 // Unclaimed records from the pre-auth local installation remain isolated here
@@ -148,6 +155,11 @@ export function ensureSchema() {
             value TEXT NOT NULL,
             observed_at TEXT NOT NULL,
             valid_from TEXT,
+            plan_tier TEXT,
+            currency TEXT,
+            billing_interval TEXT,
+            price_basis TEXT,
+            region TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (research_session_id) REFERENCES research_sessions(id),
             FOREIGN KEY (entity_id) REFERENCES entities(id),
@@ -168,6 +180,19 @@ export function ensureSchema() {
         const columns = await db.execute(`PRAGMA table_info(${table})`);
         if (!columns.rows.some((row) => String(row.name) === column)) {
           await db.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+        }
+      }
+      const observationColumns = await db.execute("PRAGMA table_info(observations)");
+      const existingObservationColumns = new Set(observationColumns.rows.map((row) => String(row.name)));
+      for (const [column, definition] of [
+        ["plan_tier", "TEXT"],
+        ["currency", "TEXT"],
+        ["billing_interval", "TEXT"],
+        ["price_basis", "TEXT"],
+        ["region", "TEXT"],
+      ]) {
+        if (!existingObservationColumns.has(column)) {
+          await db.execute(`ALTER TABLE observations ADD COLUMN ${column} ${definition}`);
         }
       }
       await db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: [LOCAL_USER_ID] });
@@ -437,7 +462,8 @@ export async function getObservations(input: {
   if (!conditions.length) return [];
   const result = await db.execute({
     sql: `SELECT o.id, o.research_session_id, o.entity_id, o.source_id, o.attribute,
-                 o.value, o.observed_at, o.valid_from, e.display_name, e.entity_type,
+                 o.value, o.observed_at, o.valid_from, o.plan_tier, o.currency,
+                 o.billing_interval, o.price_basis, o.region, e.display_name, e.entity_type,
                  s.url, s.title, s.publisher, s.published_at, s.retrieved_at
           FROM observations o JOIN entities e ON e.id = o.entity_id
           JOIN sources s ON s.id = o.source_id
@@ -502,9 +528,13 @@ export async function saveObservations(
         const id = randomUUID();
         await transaction.execute({
           sql: `INSERT INTO observations
-                (id, research_session_id, entity_id, source_id, attribute, value, observed_at, valid_from)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          args: [id, researchSessionId, resolvedEntityId, resolvedSourceId, observation.attribute, observation.value, observedAt, observation.validFrom ?? null],
+                (id, research_session_id, entity_id, source_id, attribute, value, observed_at, valid_from,
+                 plan_tier, currency, billing_interval, price_basis, region)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [id, researchSessionId, resolvedEntityId, resolvedSourceId, observation.attribute, observation.value, observedAt, observation.validFrom ?? null,
+            observation.comparison?.planTier ?? null, observation.comparison?.currency ?? null,
+            observation.comparison?.billingInterval ?? null, observation.comparison?.priceBasis ?? null,
+            observation.comparison?.region ?? null],
         });
         saved.push({ ...observation, id, researchSessionId, entityId: resolvedEntityId, sourceId: resolvedSourceId, observedAt, retrievedAt });
       }
