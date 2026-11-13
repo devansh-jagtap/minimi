@@ -1,53 +1,68 @@
-# Structured research memory design
+# Minimi architecture and structured research memory
 
-## Existing request flow
+## Request flow
 
-The App Router chat endpoint validates the incoming message, saves it, reads up to 15 recent messages, and calls `streamText`. The agent uses the configured Google Gemini model and exposes exactly one model-callable tool: `webSearch`. That tool sends up to three focused queries per invocation to Tavily, with up to five results per query. Text is streamed with the AI SDK response helper. Errors are logged; request validation returns HTTP 400 and other setup errors return HTTP 500.
+The Next.js App Router chat endpoint authenticates requests with Clerk. It accepts a message, optional conversation ID, browser time zone, stream mode, and web-search toggle. Conversation reads and writes are scoped to the Clerk user ID. The endpoint can retrieve global conversation memory and structured research evidence for that same authenticated user before it calls the Gemini model. The model has exactly one callable tool, `webSearch`, implemented with Tavily. Research-memory extraction runs after the answer and is an application-side Gemini structured-output call; it is not exposed as a model tool.
 
-The database module creates the existing `conversations` and `messages` tables without replacing them. Schema setup uses additive `CREATE TABLE/INDEX IF NOT EXISTS` statements and is safe to repeat. A process-local write queue serializes application writes; observation batches use a LibSQL write transaction. Entity names are case-insensitively deduplicated, and sources are deduplicated by URL.
+The route supports plain text and newline-delimited event streams. Search events and answer text are streamed to the client. The endpoint validates request bodies and returns bounded errors. History-recall requests are answered from saved user/assistant turns without invoking web search.
 
-## Tables
+## Authentication and ownership
 
-| Table | Purpose | Important relationships |
-| --- | --- | --- |
-| `research_sessions` | A research answer tied to a conversation, topic, summary, and retrieval time | `conversation_id` references `conversations.id` |
-| `entities` | Normalized company, product, technology, or other entity identity | `normalized_name` is unique |
-| `sources` | Source URL and first-seen metadata, plus latest retrieval time | URL is unique |
-| `observations` | An evidence-backed attribute/value at a particular observation time | References its session, entity, and source |
+Clerk supplies the owner ID used in database operations. Conversation messages are read through a join to `conversations` with the matching `user_id`; writes verify the existing conversation owner. Research sessions and durable memory items have user ownership and are retrieved by the authenticated owner. Deletion checks ownership in a write transaction before removing a conversation and its dependent messages, memory, research sessions, and observations. Shared sources and entities are deleted only when no remaining observation references them.
 
-Indexes cover session lookup by conversation and topic, observation lookup by entity/attribute and session, and entity display names. Foreign keys are enabled on the database connection. SQL values are parameterized; only placeholder counts and fixed field names are assembled dynamically.
+The legacy claim endpoint allows a signed-in user to claim listed conversations whose owner is the configured local owner or `local-single-user`. This is a migration path for a single-user local installation, not proof of which account originally created a legacy conversation; the client must only offer records the user intends to import. The ownership tests cover route-level data helpers and transaction behavior, but do not establish identity for ambiguous legacy records.
 
-An observation is never updated in place when a new value is found. New values produce new observation rows. Source title, publisher, and published date stay as first-seen metadata for that URL; `sources.retrieved_at` advances to the latest retrieval. The observation's own `observed_at` preserves when that specific value was captured and is used as the historical retrieval time in comparison context.
+## Database and migrations
 
-## Extraction and evidence rules
+The database is LibSQL. `ensureSchema()` creates tables and indexes with `CREATE ... IF NOT EXISTS`, then adds missing owner and comparison columns with `ALTER TABLE`. This is an idempotent additive migration path, not a version-numbered migration framework. Foreign-key checks are enabled on the application connection. A process-local write queue serializes writes made through one module instance; database write transactions provide the transaction boundaries. The process-local queue does not coordinate separate server processes.
 
-Search hits are captured in application code while the model uses `webSearch`. After generation, `generateObject` requests at most 12 structured facts from up to ten hits, with bounded excerpt and answer sizes. It is skipped when the request has no successful search result. Each extracted fact must carry an exact source URL and a verbatim evidence excerpt. The application rejects malformed output, unknown URLs, non-matching excerpts, and unsupported `validFrom` values before database writes. This checks support against Tavily's returned content snippet, not the full source page.
+| Table | Purpose and ownership |
+| --- | --- |
+| `conversations` | Conversation ID, `user_id`, creation time. |
+| `messages` | User and assistant turns linked to a conversation; ownership is enforced by joining through `conversations`. |
+| `local_users` | Local user-ID records referenced by durable memory rows. Clerk IDs are stored here as needed. |
+| `memory_items` | Durable cross-conversation memories, scoped by `user_id`, with source conversation reference and deduplication by owner, source conversation, and normalized summary. |
+| `research_sessions` | Research question, answer summary, retrieval time, conversation ID, and `user_id`. |
+| `entities` | Case-normalized entity identity shared across evidence rows; it has no owner column. |
+| `sources` | URL and first-seen title/publisher/publication metadata, plus latest retrieval time; it has no owner column. |
+| `observations` | Historical evidence value, entity/source/session links, observation/effective dates, and optional comparison dimensions. |
 
-Fields have distinct meanings:
+`observations` preserves old rows: new research inserts a new observation rather than replacing a previous value. Comparison metadata is stored in nullable columns `plan_tier`, `currency`, `billing_interval`, `price_basis`, and `region`. Existing rows receive `NULL` for those fields, so they cannot support a confirmed price change under the comparison rules. Entity/source rows are shared and unowned; user isolation depends on first selecting owner-scoped research sessions and fetching observations only for those session IDs. The low-level observation/source helper functions do not independently require an owner parameter, so callers must retain that ordering constraint.
 
-- `sources.published_at`: publication date reported by the source/search response.
-- `sources.retrieved_at`: latest time Minimi retrieved that source URL.
-- `observations.observed_at`: time Minimi recorded that specific value; historical rows retain it.
-- `observations.valid_from`: effective date only when the source excerpt explicitly supports it.
-- `research_sessions.researched_at`: latest retrieval time represented by the research session.
+## Cross-conversation memory
 
-Observation and session times use ISO 8601 UTC timestamps. Minimi does not infer an effective date from the date it found a fact.
+Chat messages and durable memory are retrieved across conversations for the authenticated user. Message search uses bounded lexical matching over recent user-owned messages; date filters are applied to message timestamps. Durable memory retrieval uses a bounded set of query terms against memory summaries and content. This is not embedding-based semantic retrieval, and exact wording or short/ambiguous prompts can miss relevant history. Retrieved memory is supplied as context to Gemini; it is not itself a separate model tool.
 
-## Historical retrieval and comparison
+Historical recall pairs a matching user turn with the next assistant turn in that conversation, excludes known fallback answers, and returns a bounded number of matches. Explicit dates and weekday references use the request's IANA time-zone value sent by the browser. If the field is missing or invalid, the route uses UTC. Database timestamps without an explicit offset are interpreted as UTC. Date queries are converted to local-day UTC start/end boundaries, then checked again against the requested local calendar date. An unqualified weekday resolves to its most recent occurrence (or the prior week when today has that weekday); `last` and `previous` resolve strictly before the current local date. This is browser time-zone behavior, not a saved account preference.
 
-Retrieval is conversation-scoped and exact/lexical; it does not require vector search. The app scores up to 50 sessions from the current conversation using entity-name mentions and topic/summary token overlap, includes explicit date or recent-weekday matches, and selects at most five sessions. At most eight observations per selected session are passed to the model. Recent user messages can help resolve references such as “those tools”; the current message alone determines date matching.
+## Structured research retrieval and comparison
 
-When prior evidence is available, the agent receives its values, observation dates, and citations as untrusted data. It must use `webSearch` for current evidence, prefer official pricing, documentation, and release sources, and compare like-for-like entities and attributes. It should label a result as a confirmed change only when comparable evidence supports the difference; equal values can support “no change found in available evidence”; missing historical or current evidence requires “insufficient evidence.” A failed search is returned as a bounded tool result and must not be described as proof of no change.
+Successful Tavily search results are retained in application code while Gemini generates an answer. A separate structured extraction call receives bounded search snippets and can return up to twelve observations from up to ten hits. Each saved observation must point to an exact supplied URL and include a verbatim quote found in that hit. The application deterministically checks extracted numeric values, recognized currency, common price units, and supported explicit effective dates where possible. It rejects mismatched amounts, currencies, units, and unsupported dates. This validation cannot prove arbitrary natural-language claims, source authority, or that a search snippet is complete; non-numeric values must match the quoted text after normalization.
 
-## Operational measurements
+Research retrieval is global across conversations for one authenticated owner. It scores at most fifty owner-scoped sessions using entity mentions, topic/summary token overlap, and date matches; it returns up to five sessions and at most eight observations per session. Only those selected owner-scoped session IDs are used to load observations. Historical facts include their observation time and source citation.
 
-Server logs include historical retrieval latency, Tavily query count and latency, successful result count, extraction latency, chat model-step count, whether extraction was attempted, total request latency, and the number of supported observations saved. No benchmark values are asserted; these measurements need production traffic before performance claims can be made.
+Price comparisons require matching entity and attribute plus non-empty matching plan tier, currency, billing interval, price basis, and region. The values must contain one parseable amount and use the same recognized currency. A difference under those conditions is classified as a confirmed change; equal normalized values are “no change found in available evidence.” Missing or mismatched dimensions, missing evidence, ambiguous amounts, or unsupported attributes return “insufficient evidence.” Non-price comparisons still rely on exact normalized entity/attribute matching and normalized value equality; arbitrary semantic equivalence is not inferred.
+
+## Time fields
+
+- `sources.published_at` is the publication date reported by Tavily when available.
+- `sources.retrieved_at` records the latest retrieval time for a URL.
+- `observations.observed_at` records when that value was captured and is preserved with the historical row.
+- `observations.valid_from` is set only when an effective date is explicitly supported by the evidence quote.
+- `research_sessions.researched_at` is the retrieval time represented by the session.
+- Conversation and message `created_at` values are LibSQL timestamp strings and are treated as UTC by historical recall.
+
+## Local database artifact
+
+`data/minimi.db` is currently tracked by Git and should be removed from repository tracking while remaining intact on the developer's machine. It should not be committed or copied into fixtures because it contains mixed development records and may include private conversations. The inspected local database contained 12 conversations, 39 messages, 2 research sessions, and 10 observations. Counts and date ranges were used for inspection; message text was not printed. Six conversation IDs and three messages contained test-like markers, so this database cannot be classified as purely test data or empty. Keep the local file intact, and use synthetic fixtures in tests.
 
 ## Limitations
 
-- Research memory is scoped to the supplied conversation ID. The current app has no user identity layer or cross-conversation account boundary.
-- Entity/topic/date matching is deterministic lexical matching. Ambiguous references, unusual date formats, or a conversation outside the recent message window may not resolve correctly.
-- Relative weekday resolution uses the server's UTC calendar because the app has no user-timezone setting.
-- Evidence validation checks a verbatim excerpt in Tavily's snippet. It does not independently fetch the full page or guarantee that a source is authoritative; the model is instructed to prefer official sources.
-- “No change found” describes the evidence Minimi could compare. It is not a guarantee that no unindexed announcement or change exists.
-- The CRM, 3 November recall, and Postgres-hosting test cases use fixtures. They verify persistence and comparison behavior, not current vendor pricing or live releases.
+- There is no dedicated background worker, embedding store, vector index, or document RAG pipeline in the current implementation.
+- Memory and research matching are deterministic lexical/date retrieval, so paraphrases and ambiguous references can be missed.
+- Evidence validation checks only supplied search snippets and cannot independently verify all natural-language claims or source credibility.
+- Price comparisons are intentionally conservative; old observations or current sources missing any required comparison dimension return insufficient evidence.
+- “No change found” means no change was found in the retrieved comparable evidence, not that no change exists elsewhere.
+- CRM, historical recall, and Postgres-hosting regression scenarios use static fixtures. They test application behavior, not current vendor pricing or live announcements.
+- Legacy conversation claiming cannot determine the rightful owner of shared pre-auth data. Deployments should avoid importing ambiguous records across accounts.
+- The database uses additive inline schema setup, not a managed migration history. The write queue is process-local.
