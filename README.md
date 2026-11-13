@@ -28,7 +28,13 @@ bun run build
 bun run start
 ```
 
-The build script uses Next.js's webpack build mode because the default Turbopack build exits while starting its CSS worker in this environment. Here, webpack compilation and type checking succeed, but static page generation can still hit a Windows `EPERM` while writing parallel `.next` output under OneDrive. A clean local filesystem may avoid that workspace-specific build error.
+## Document uploads
+
+Copy the R2 variables from `.env.example` into the server's local environment and create a private R2 bucket plus a bucket-scoped S3 API token with object read/write access. Set bucket CORS to the exact Minimi app origin and permit `PUT` with `Content-Type`. Never commit or paste `R2_SECRET_ACCESS_KEY` into chat.
+
+Run `bun run worker` in a second terminal while testing uploads. The worker reads queued files from R2, extracts text, creates page/section-aware chunks and embeddings, and makes them available only to the owning user in the conversation where they were uploaded. The upload limit is 25 MiB; supported types are PDF, DOCX, TXT, PNG, JPEG, and WebP.
+
+The production build uses Next.js webpack mode. The document worker is a separate local process; deploy it as a long-running worker alongside the web app when hosting document processing.
 
 ## Memory lifecycle
 
