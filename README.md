@@ -1,36 +1,36 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Minimi
 
-## Getting Started
+Minimi is a persistent web research assistant built with Next.js App Router, TypeScript, Bun, Vercel AI SDK, Google Gemini, Tavily, LibSQL, and Zod. It stores prior research as evidence-linked observations and can compare those observations with current search results.
 
-First, run the development server:
+## Setup
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+1. Copy `.env.example` to `.env.local` and provide your Google AI and Tavily keys.
+2. Install dependencies with `bun install`.
+3. Start the app with `bun run dev` and open [http://localhost:3000](http://localhost:3000).
+
+Useful commands:
+
+```sh
+bun run dev
+bun run test
+bun run lint
+bun run build
+bun run start
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The build script uses Next.js's webpack build mode. In this repository's installed Next.js 16.4.6 environment, the default Turbopack build exits while starting its CSS worker; webpack completed the production build successfully.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Memory lifecycle
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- Chat messages continue to be saved in `conversations` and `messages`.
+- Before answering, the app searches research sessions in the same conversation and selects exact entity, topic, or date matches.
+- The model has one callable tool, `webSearch`. Search hits are retained by application code with their URL, published date, and retrieval time.
+- After a response that used search, a bounded extraction call proposes structured facts. Zod validates the shape, and the app stores only facts whose URL is one of the returned hits and whose supporting excerpt occurs verbatim in that hit.
+- Observations are appended with their own observation time. Entity names and source URLs are deduplicated; historical values and source metadata remain available.
+- For historical comparisons, the prior facts and citations are supplied as untrusted evidence. The model searches current evidence and distinguishes confirmed change, no change found in comparable evidence, and insufficient evidence.
 
-## Learn More
+The schema is created additively and idempotently on first database use. Existing conversation data is left in place. See [DESIGN.md](./DESIGN.md) for the schema, matching rules, temporal fields, and limitations.
 
-To learn more about Next.js, take a look at the following resources:
+## Tests
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+`bun run test` uses a temporary LibSQL database and deterministic fixtures. CRM shortlist, date recall, and Postgres-hosting cases are fixtures; they do not claim that current vendor prices or product changes were checked live. Live research requires configured Google AI and Tavily credentials.
