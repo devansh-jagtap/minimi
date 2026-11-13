@@ -8,6 +8,7 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  attachments?: Array<{ id: string; filename: string }>;
   activity?: SearchActivity[];
   phase?: string;
 };
@@ -172,6 +173,14 @@ function MessageText({ content }: { content: string }) {
   })}</div>;
 }
 
+function MessageAttachment({ filename }: { filename: string }) {
+  const extension = filename.split(".").pop()?.toUpperCase().slice(0, 4) || "FILE";
+  return <div className="message-attachment">
+    <span className="message-attachment-icon" aria-hidden="true">{extension}</span>
+    <span className="message-attachment-copy"><span className="message-attachment-name">{filename}</span><span className="message-attachment-label">Document</span></span>
+  </div>;
+}
+
 function SearchActivityView({ activity, phase, now }: { activity: SearchActivity[]; phase?: string; now: number }) {
   if (!activity.length && !phase) return null;
   const sourceCount = activity.reduce((count, item) => count + item.sources.length, 0);
@@ -197,12 +206,17 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
   const [uploadStatus, setUploadStatus] = useState("");
   const [uploadedDocuments, setUploadedDocuments] = useState<UploadedDocument[]>([]);
+  const [isUploadingFile, setIsUploadingFile] = useState(false);
+  const [removingDocumentIds, setRemovingDocumentIds] = useState<string[]>([]);
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const [activityNow, setActivityNow] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const conversationsRef = useRef(conversations);
   const activeIdRef = useRef(activeId);
+  const sentDocumentIds = new Set(messages.flatMap((message) => message.attachments?.map((attachment) => attachment.id) ?? []));
+  const composerDocuments = uploadedDocuments.filter((document) => !sentDocumentIds.has(document.id));
+  const waitingForFiles = isUploadingFile || composerDocuments.some((document) => ["uploaded", "queued", "processing"].includes(document.status));
 
   useEffect(() => { conversationsRef.current = conversations; }, [conversations]);
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
@@ -346,6 +360,8 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
     const id = makeId();
     setActiveId(id);
     setMessages([]);
+    setUploadedDocuments([]);
+    setUploadStatus("");
     setInput("");
     setError("");
     setIsStreaming(false);
@@ -367,6 +383,8 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
     if (isStreaming) abortRef.current?.abort();
     setActiveId(conversation.id);
     setMessages(conversation.messages ?? []);
+    setUploadedDocuments([]);
+    setUploadStatus("");
     setError("");
     setIsStreaming(false);
     setIsSidebarOpen(false);
@@ -387,6 +405,8 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
         activeIdRef.current = nextId;
         setActiveId(nextId);
         setMessages([]);
+        setUploadedDocuments([]);
+        setUploadStatus("");
         setIsStreaming(false);
         localStorage.setItem(accountStorageKey(ACTIVE_CONVERSATION_KEY, userId), nextId);
       }
@@ -398,14 +418,21 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
 
   const sendMessage = useCallback(async (text = input) => {
     const content = text.trim();
-    if (!content || isStreaming) return;
+    if (!content || isStreaming || waitingForFiles) return;
 
     const conversationId = activeIdRef.current || makeId();
     if (!activeIdRef.current) setActiveId(conversationId);
-    const userMessage: Message = { id: makeId(), role: "user", content, createdAt: new Date().toISOString() };
+    const userMessage: Message = {
+      id: makeId(),
+      role: "user",
+      content,
+      createdAt: new Date().toISOString(),
+      attachments: composerDocuments.map((document) => ({ id: document.id, filename: document.filename })),
+    };
     const assistantId = makeId();
     const assistantMessage: Message = { id: assistantId, role: "assistant", content: "", createdAt: new Date().toISOString(), activity: [], phase: "Preparing research" };
     setMessages((current) => [...current, userMessage, assistantMessage]);
+    if (userMessage.attachments?.length) setUploadStatus("");
     setInput("");
     setError("");
     setIsStreaming(true);
@@ -486,56 +513,102 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
         setIsStreaming(false);
       }
     }
-  }, [input, isStreaming, webSearchEnabled]);
+  }, [composerDocuments, input, isStreaming, webSearchEnabled, waitingForFiles]);
 
   const uploadFiles = useCallback(async (files: FileList | null) => {
-    if (!files?.length || !activeIdRef.current) return;
+    const conversationId = activeIdRef.current;
+    if (!files?.length || !conversationId) return;
+    setIsUploadingFile(true);
     const supported = new Set(["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/plain", "image/png", "image/jpeg", "image/webp"]);
     for (const file of Array.from(files)) {
-      if (!supported.has(file.type)) { setUploadStatus(`${file.name}: unsupported file type`); continue; }
+      if (!supported.has(file.type)) {
+        if (activeIdRef.current === conversationId) setUploadStatus(`${file.name}: unsupported file type`);
+        continue;
+      }
       try {
-        setUploadStatus(`Uploading ${file.name}…`);
-        const intentResponse = await fetch("/api/documents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId: activeIdRef.current, filename: file.name, mimeType: file.type, sizeBytes: file.size }) });
+        if (activeIdRef.current === conversationId) setUploadStatus(`Uploading ${file.name}…`);
+        const intentResponse = await fetch("/api/documents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId, filename: file.name, mimeType: file.type, sizeBytes: file.size }) });
         const intent = await intentResponse.json() as { id?: string; uploadUrl?: string; error?: string };
         if (!intentResponse.ok || !intent.id || !intent.uploadUrl) throw new Error(intent.error ?? "Upload could not be started.");
         const uploadResponse = await fetch(intent.uploadUrl, { method: "PUT", headers: { "Content-Type": file.type }, body: file });
         if (!uploadResponse.ok) throw new Error("R2 upload failed. Check bucket CORS and try again.");
         const complete = await fetch(`/api/documents/${intent.id}/complete`, { method: "POST" });
         if (!complete.ok) throw new Error("Upload verification failed.");
-        setUploadStatus(`${file.name} uploaded. Processing will start when the document worker is running.`);
+        if (activeIdRef.current === conversationId) {
+          setUploadedDocuments((current) => [{ id: intent.id!, filename: file.name, status: "queued" }, ...current.filter((document) => document.id !== intent.id)]);
+          setUploadStatus(`${file.name} uploaded. Preparing it for questions…`);
+        }
       } catch (caught) {
-        setUploadStatus(caught instanceof Error ? caught.message : "Document upload failed.");
+        if (activeIdRef.current === conversationId) setUploadStatus(caught instanceof Error ? caught.message : "Document upload failed.");
       }
     }
+    setIsUploadingFile(false);
     if (uploadInputRef.current) uploadInputRef.current.value = "";
   }, []);
 
   const retryDocument = useCallback(async (id: string) => {
     const response = await fetch(`/api/documents/${id}/retry`, { method: "POST" });
-    if (response.ok) setUploadStatus("Document queued again.");
+    if (response.ok) {
+      setUploadedDocuments((current) => current.map((document) => document.id === id ? { ...document, status: "queued", error_message: undefined } : document));
+      setUploadStatus("Preparing the file again…");
+    }
     else setUploadStatus("Could not retry this document.");
   }, []);
 
+  const removeDocument = useCallback(async (document: UploadedDocument) => {
+    setRemovingDocumentIds((current) => [...current, document.id]);
+    try {
+      const response = await fetch(`/api/documents/${document.id}`, { method: "DELETE" });
+      const result = await response.json().catch(() => null) as { error?: string } | null;
+      if (!response.ok) throw new Error(result?.error ?? "Could not remove this file.");
+      setUploadedDocuments((current) => current.filter((item) => item.id !== document.id));
+      setUploadStatus("");
+    } catch (caught) {
+      setUploadStatus(caught instanceof Error ? caught.message : "Could not remove this file.");
+    } finally {
+      setRemovingDocumentIds((current) => current.filter((id) => id !== document.id));
+    }
+  }, []);
+
   const currentTitle = messages.length ? firstQuestion(messages) : "New research";
+  const failedFiles = composerDocuments.some((document) => document.status === "failed");
+  const allFilesReady = composerDocuments.length > 0 && composerDocuments.every((document) => document.status === "completed");
   const composer = (
     <div className={`composer-area${messages.length === 0 ? " composer-area-centered" : ""}`}>
       {error && <div className="composer-error" role="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
       <form className="composer" onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}>
         <input ref={uploadInputRef} type="file" accept=".pdf,.docx,.txt,.png,.jpg,.jpeg,.webp" multiple hidden onChange={(event) => void uploadFiles(event.target.files)} />
-        <button type="button" className="composer-attach" onClick={() => uploadInputRef.current?.click()} disabled={!isHydrated || !activeId} aria-label="Attach documents">Attach files</button>
-        {uploadStatus && <span className="composer-hint" role="status">{uploadStatus}</span>}
-        {uploadedDocuments.length > 0 && <div className="document-list" aria-label="Conversation documents">{uploadedDocuments.map((document) => <span key={document.id} className="document-chip" title={document.error_message ?? document.status}>{document.filename} · {document.status}{document.status === "failed" && <button type="button" onClick={() => void retryDocument(document.id)}>Retry</button>}</span>)}</div>}
+        {composerDocuments.length > 0 && <div className="composer-attachments" aria-label="Files attached to your next message">
+          <div className="document-list">{composerDocuments.map((document) => {
+            const extension = document.filename.split(".").pop()?.toUpperCase().slice(0, 4) || "FILE";
+            const statusLabel = document.status === "completed" ? "Document" : document.status === "failed" ? "Could not process" : document.status === "processing" ? "Reading file…" : "Uploading…";
+            return <div key={document.id} className={`document-chip document-chip-${document.status}`} title={document.error_message ?? document.filename}>
+              <span className="document-file-icon" aria-hidden="true">{extension}</span>
+              <span className="document-chip-copy"><span className="document-chip-name">{document.filename}</span><span className="document-chip-status">{statusLabel}</span></span>
+              {document.status === "failed" && <button type="button" className="document-retry" onClick={() => void retryDocument(document.id)}>Retry</button>}
+              <button type="button" className="document-remove" onClick={() => void removeDocument(document)} disabled={document.status === "processing" || removingDocumentIds.includes(document.id)} aria-label={`Remove ${document.filename}`} title={document.status === "processing" ? "Wait for processing to finish" : "Remove file"}>{removingDocumentIds.includes(document.id) ? "…" : "×"}</button>
+            </div>;
+          })}</div>
+        </div>}
+        {waitingForFiles
+          ? <div className="composer-upload-status" role="status" aria-live="polite"><span className="attachment-spinner" aria-hidden="true" />{isUploadingFile ? "Uploading files…" : "Preparing files. Sending will unlock when they’re ready."}</div>
+          : failedFiles
+            ? <div className="composer-upload-status composer-upload-error" role="status">A file could not be prepared. Retry it before asking questions about it.</div>
+            : allFilesReady
+              ? <div className="composer-upload-status composer-upload-ready" role="status">Files ready. Your next question will use their contents.</div>
+              : uploadStatus && <div className="composer-upload-status composer-upload-error" role="status">{uploadStatus}</div>}
         <label className="sr-only" htmlFor="research-question">Ask Minimi a research question</label>
         <textarea id="research-question" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Ask a question or revisit something you researched…" rows={1} disabled={!isHydrated} />
         <div className="composer-footer">
           <div className="composer-options">
+            <button type="button" className="composer-attach" onClick={() => uploadInputRef.current?.click()} disabled={!isHydrated || !activeId || isUploadingFile} aria-label="Add files" title="Add files"><Icon name="plus" size={20} /></button>
             <label className={`web-search-toggle${webSearchEnabled ? " web-search-enabled" : ""}`} title="When on, Minimi may search the public web for current information.">
               <input type="checkbox" checked={webSearchEnabled} onChange={(event) => setWebSearchEnabled(event.target.checked)} />
               <Icon name="web" size={15} /><span>Web search</span><span className="toggle-state">{webSearchEnabled ? "On" : "Off"}</span>
             </label>
-            <span className="composer-hint"><Icon name="clock" size={14} /> Past research stays attached to this conversation</span>
+            <span className="composer-hint"><Icon name="clock" size={14} /> Your files can be recalled from other chats</span>
           </div>
-          {isStreaming ? <button type="button" className="send-button stop-button" onClick={() => abortRef.current?.abort()} aria-label="Stop response"><Icon name="stop" size={17} /></button> : <button type="submit" className="send-button" disabled={!input.trim()} aria-label="Send question"><Icon name="send" size={17} /></button>}
+          {isStreaming ? <button type="button" className="send-button stop-button" onClick={() => abortRef.current?.abort()} aria-label="Stop response"><Icon name="stop" size={17} /></button> : <button type="submit" className="send-button" disabled={!input.trim() || waitingForFiles} aria-label={waitingForFiles ? "Wait for files to finish processing" : "Send question"}><Icon name="send" size={17} /></button>}
         </div>
       </form>
       <p className="composer-disclaimer">Minimi can make mistakes. Check important details against the linked sources.</p>
@@ -583,7 +656,7 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
             <span className="memory-note-mark"><span /></span>
             <div>
               <strong>Memory is on</strong>
-              <span>Research stays with this thread</span>
+              <span>Saved research can be recalled across chats</span>
             </div>
           </div>
           <div className="profile-row">
@@ -640,6 +713,7 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
                     <div className="message-body">
                       {message.role === "assistant" && <div className="message-author">Minimi <span>Research assistant</span></div>}
                       {message.role === "assistant" && <SearchActivityView activity={message.activity ?? []} phase={message.phase} now={activityNow} />}
+                      {message.role === "user" && !!message.attachments?.length && <div className="message-attachments" aria-label="Attached files">{message.attachments.map((attachment) => <MessageAttachment key={attachment.id} filename={attachment.filename} />)}</div>}
                       {message.content ? <MessageText content={message.content} /> : (
                         <div className="thinking-indicator"><span /><span /><span /><span>Working on your answer</span></div>
                       )}
