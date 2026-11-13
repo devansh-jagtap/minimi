@@ -1,36 +1,46 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Minimi
 
-## Getting Started
+Minimi is a persistent web research assistant built with Next.js App Router, TypeScript, Bun, Vercel AI SDK, Google Gemini, Tavily, LibSQL, and Zod. It stores prior research as evidence-linked observations and can compare those observations with current search results.
 
-First, run the development server:
+## Setup
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+1. Copy `.env.example` to `.env.local` and provide your Google AI and Tavily keys.
+2. Open the selected Clerk application (`app_3M1cyqyRyVegjHarhz8IBomUHvO`) in the Clerk Dashboard and go to **API Keys**. Copy its development Publishable Key and Secret Key into `.env.local`:
+
+   ```env
+   NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
+   CLERK_SECRET_KEY=sk_test_...
+   ```
+
+   Keep `CLERK_SECRET_KEY` private and out of Git. The app requires both keys before it serves the workspace. On this Windows setup, the Clerk CLI binary is blocked by Application Control, so use the Dashboard instead of `bunx clerk`.
+3. Install dependencies with `bun install`.
+4. Start the app with `bun run dev` and open [http://localhost:3000](http://localhost:3000). Sign in or create an account to use Minimi.
+
+The first account that signs in on a browser can import its saved pre-auth chats. Those chats are moved to that account's storage namespace and matching local database records are claimed once. Each account gets a separate conversation namespace and server-side owner scope.
+
+Useful commands:
+
+```sh
+bun run dev
+bun run test
+bun run lint
+bun run build
+bun run start
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The build script uses Next.js's webpack build mode because the default Turbopack build exits while starting its CSS worker in this environment. Here, webpack compilation and type checking succeed, but static page generation can still hit a Windows `EPERM` while writing parallel `.next` output under OneDrive. A clean local filesystem may avoid that workspace-specific build error.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Memory lifecycle
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- Chat messages continue to be saved in `conversations` and `messages`.
+- Before answering, the app searches research sessions in the same conversation and selects exact entity, topic, or date matches.
+- The model has one callable tool, `webSearch`. Search hits are retained by application code with their URL, published date, and retrieval time.
+- After a response that used search, a bounded extraction call proposes structured facts. Zod validates the shape, and the app stores only facts whose URL is one of the returned hits and whose supporting excerpt occurs verbatim in that hit.
+- Observations are appended with their own observation time. Entity names and source URLs are deduplicated; historical values and source metadata remain available.
+- For historical comparisons, the prior facts and citations are supplied as untrusted evidence. The model searches current evidence and distinguishes confirmed change, no change found in comparable evidence, and insufficient evidence.
 
-## Learn More
+The schema is created additively and idempotently on first database use. Existing conversation data is left in place. See [DESIGN.md](./DESIGN.md) for the schema, matching rules, temporal fields, and limitations.
 
-To learn more about Next.js, take a look at the following resources:
+## Tests
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+`bun run test` uses a temporary LibSQL database and deterministic fixtures. CRM shortlist, date recall, and Postgres-hosting cases are fixtures; they do not claim that current vendor prices or product changes were checked live. Live research requires configured Google AI and Tavily credentials. Account-based chat and memory require configured Clerk keys.

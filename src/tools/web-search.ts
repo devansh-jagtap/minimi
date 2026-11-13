@@ -64,6 +64,7 @@ type SearchHit = {
   content: string;
   score?: number;
   publishedDate?: string;
+  retrievedAt: string;
 };
 
 type SearchFailure = {
@@ -73,7 +74,11 @@ type SearchFailure = {
 
 type SearchResult = SearchHit | SearchFailure;
 
-export const webSearch = tool({
+export function createWebSearchTool(
+  onResults?: (hits: SearchHit[]) => void,
+  onSearchCall?: (queryCount: number) => void,
+) {
+  return tool({
   description: `
     Search the public web for current and historical information.
 
@@ -96,8 +101,10 @@ export const webSearch = tool({
       .describe("One to three focused web search queries"),
   }),
 
-  execute: async ({ queries }): Promise<SearchResult[]> => {
+    execute: async ({ queries }): Promise<SearchResult[]> => {
     const uniqueQueries = [...new Set(queries)];
+    onSearchCall?.(uniqueQueries.length);
+    const startedAt = Date.now();
 
     console.info(
       `[Minimi] Tavily started: ${uniqueQueries.length} queries`
@@ -117,7 +124,7 @@ export const webSearch = tool({
     );
 
     console.info(
-      `[Minimi] Tavily completed: ${successful}/${uniqueQueries.length} successful searches, ${totalResults} results`
+      `[Minimi] Tavily completed: ${successful}/${uniqueQueries.length} successful searches, ${totalResults} results in ${Date.now() - startedAt}ms`
     );
     const output: SearchResult[] = [];
 
@@ -128,9 +135,11 @@ export const webSearch = tool({
         const hits: SearchHit[] = result.value.map((item) => ({
           ...item,
           searchQuery,
+          retrievedAt: new Date().toISOString(),
         }));
 
         output.push(...hits);
+        onResults?.(hits);
       } else {
         console.error(
           `Search failed for "${searchQuery}":`,
@@ -149,4 +158,9 @@ export const webSearch = tool({
 
     return output;
   },
-});
+  });
+}
+
+export const webSearch = createWebSearchTool();
+
+export type { SearchHit };
