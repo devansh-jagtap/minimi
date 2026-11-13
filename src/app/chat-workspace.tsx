@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { UserButton } from "@clerk/nextjs";
 
 type Message = {
   id: string;
@@ -11,7 +12,7 @@ type Message = {
   phase?: string;
 };
 
-type SearchActivity = { id: string; query: string; status: "searching" | "complete" | "failed"; sources: Array<{ title: string; url: string }> };
+type SearchActivity = { id: string; query: string; status: "searching" | "complete" | "failed"; startedAt: number; durationMs?: number; sources: Array<{ title: string; url: string }> };
 
 type SavedConversation = {
   id: string;
@@ -22,24 +23,15 @@ type SavedConversation = {
 
 const CONVERSATIONS_KEY = "minimi-conversations-v1";
 const ACTIVE_CONVERSATION_KEY = "minimi-active-conversation-v1";
+const THEME_KEY = "minimi-theme-v1";
+const WEB_SEARCH_KEY = "minimi-web-search-v1";
+const LEGACY_IMPORT_KEY = "minimi-legacy-import-v1";
+const LEGACY_IMPORT_OWNER_KEY = "minimi-legacy-import-owner-v1";
 
-const suggestions = [
-  {
-    label: "Check a shortlist",
-    prompt: "On Monday we shortlisted five CRM tools for a 20-person sales team. Has any of them changed pricing or shipped something big since?",
-    icon: "compare",
-  },
-  {
-    label: "Revisit an answer",
-    prompt: "What did I ask you on 3 November? Is your answer still correct today?",
-    icon: "calendar",
-  },
-  {
-    label: "Track hosting prices",
-    prompt: "Last Tuesday I asked you about Postgres hosting. Has any pricing changed since?",
-    icon: "database",
-  },
-] as const;
+function accountStorageKey(key: string, userId: string) {
+  return `${key}:${userId}`;
+}
+
 
 function Icon({ name, size = 18 }: { name: string; size?: number }) {
   const common = {
@@ -65,6 +57,10 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
   if (name === "compare") return <svg {...common}><path d="M7 4v16m0-16 4 4M7 4 3 8m14 12V4m0 16-4-4m4 4 4-4" /></svg>;
   if (name === "calendar") return <svg {...common}><rect x="3.5" y="5" width="17" height="15" rx="2" /><path d="M7.5 3v4M16.5 3v4M4 9.5h16" /></svg>;
   if (name === "database") return <svg {...common}><ellipse cx="12" cy="5" rx="7.5" ry="3" /><path d="M4.5 5v7c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V5M4.5 12v7c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-7" /></svg>;
+  if (name === "trash") return <svg {...common}><path d="M4 7h16M9 7V4h6v3m3 0-.8 13H6.8L6 7m4 4v5m4-5v5" /></svg>;
+  if (name === "sun") return <svg {...common}><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42" /></svg>;
+  if (name === "moon") return <svg {...common}><path d="M20.2 15.1A8.4 8.4 0 0 1 8.9 3.8 8.5 8.5 0 1 0 20.2 15.1Z" /></svg>;
+  if (name === "web") return <svg {...common}><circle cx="12" cy="12" r="9" /><path d="M3.5 12h17M12 3c2.3 2.5 3.5 5.5 3.5 9S14.3 18.5 12 21c-2.3-2.5-3.5-5.5-3.5-9S9.7 5.5 12 3Z" /></svg>;
   return <svg {...common}><circle cx="12" cy="12" r="8.5" /><path d="M8.5 12h7M12 8.5v7" /></svg>;
 }
 
@@ -85,12 +81,16 @@ function formatDate(date: string) {
 }
 
 function MessageText({ content }: { content: string }) {
-  const normalized = content.replace(/(https?:\/\/[^\s)\]>]+)(?:\s*\1){2,}/g, "$1 [repeated link omitted]");
+  const normalized = content
+    .replace(/(https?:\/\/[^\s)\]>]+)(?:\s*\1){2,}/g, "$1 [repeated link omitted]")
+    .replace(/\\([*_`#[\]()>])/g, "$1")
+    .replace(/\\n/g, "\n");
   const lines = normalized.replace(/\r\n?/g, "\n").split("\n");
-  const blocks: Array<{ type: "paragraph" | "ul" | "ol" | "code" | "hr" | "heading"; lines: string[]; level?: number }> = [];
+  const blocks: Array<{ type: "paragraph" | "ul" | "ol" | "code" | "hr" | "heading" | "quote" | "table"; lines: string[]; level?: number }> = [];
   let current: (typeof blocks)[number] | null = null;
   let codeFence = false;
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (line.trim().startsWith("```")) {
       if (codeFence) { if (current) blocks.push(current); current = null; }
       else { if (current) blocks.push(current); current = { type: "code", lines: [] }; }
@@ -100,13 +100,28 @@ function MessageText({ content }: { content: string }) {
     if (codeFence) { current?.lines.push(line); continue; }
     const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+)$/);
     const list = line.match(/^\s*(?:([-*+])\s+|\d+[.)]\s+)(.+)$/);
+    const quote = line.match(/^\s*>\s?(.*)$/);
     if (!line.trim()) { if (current) blocks.push(current); current = null; continue; }
     if (/^\s*(---+|\*\*\*+)\s*$/.test(line)) { if (current) blocks.push(current); current = null; blocks.push({ type: "hr", lines: [] }); continue; }
     if (heading) { if (current) blocks.push(current); blocks.push({ type: "heading", level: heading[1].length, lines: [heading[2]] }); current = null; continue; }
+    if (quote) {
+      if (current?.type !== "quote") { if (current) blocks.push(current); current = { type: "quote", lines: [] }; }
+      current.lines.push(quote[1]);
+      continue;
+    }
+    if (line.includes("|") && lines[index + 1]?.trim().match(/^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/)) {
+      if (current) blocks.push(current);
+      blocks.push({ type: "table", lines: [line, lines[index + 1]] });
+      index += 1;
+      while (index + 1 < lines.length && lines[index + 1].includes("|")) blocks.at(-1)?.lines.push(lines[++index]);
+      current = null;
+      continue;
+    }
     if (list) {
       const type = /^\s*\d/.test(line) ? "ol" : "ul";
-      if (current?.type !== type) { if (current) blocks.push(current); current = { type, lines: [] }; }
-      current.lines.push(list[2]);
+      const active = current as (typeof blocks)[number] | null;
+      if (active?.type !== type) { if (active) blocks.push(active); current = { type, lines: [] }; }
+      (current as (typeof blocks)[number]).lines.push(list[2].replace(/^\[([ xX])\]\s+/, (_, checked: string) => `${checked.trim() ? "☑" : "☐"} `));
       continue;
     }
     if (current?.type !== "paragraph") { if (current) blocks.push(current); current = { type: "paragraph", lines: [] }; }
@@ -133,29 +148,36 @@ function MessageText({ content }: { content: string }) {
     if (cursor < text.length) output.push(text.slice(cursor));
     return output;
   };
+  const tableCells = (row: string) => row.trim().replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
   return <div className="message-copy">{blocks.map((block, index) => {
     const key = `block-${index}`; const value = block.lines.join(block.type === "paragraph" ? "\n" : "");
     if (block.type === "hr") return <hr key={key} />;
     if (block.type === "code") return <pre key={key}><code>{value}</code></pre>;
+    if (block.type === "quote") return <blockquote key={key}>{block.lines.map((line, lineIndex) => <p key={`${key}-${lineIndex}`}>{inline(line, `${key}-${lineIndex}`)}</p>)}</blockquote>;
+    if (block.type === "table") {
+      const rows = block.lines.filter((_, rowIndex) => rowIndex !== 1).map(tableCells);
+      const headers = rows[0] ?? [];
+      return <div className="message-table-wrap" key={key}><table><thead><tr>{headers.map((cell, cellIndex) => <th key={`${key}-h-${cellIndex}`}>{inline(cell, `${key}-h-${cellIndex}`)}</th>)}</tr></thead><tbody>{rows.slice(1).map((row, rowIndex) => <tr key={`${key}-r-${rowIndex}`}>{headers.map((_, cellIndex) => <td key={`${key}-${rowIndex}-${cellIndex}`}>{inline(row[cellIndex] ?? "", `${key}-${rowIndex}-${cellIndex}`)}</td>)}</tr>)}</tbody></table></div>;
+    }
     if (block.type === "heading") { const Tag = `h${block.level}` as "h1"; return <Tag key={key}>{inline(value, key)}</Tag>; }
     if (block.type === "ul" || block.type === "ol") { const Tag = block.type; return <Tag key={key}>{block.lines.map((item, itemIndex) => <li key={`${key}-${itemIndex}`}>{inline(item, `${key}-${itemIndex}`)}</li>)}</Tag>; }
     return <p key={key}>{inline(value, key)}</p>;
   })}</div>;
 }
 
-function SearchActivityView({ activity, phase }: { activity: SearchActivity[]; phase?: string }) {
+function SearchActivityView({ activity, phase, now }: { activity: SearchActivity[]; phase?: string; now: number }) {
   if (!activity.length && !phase) return null;
   const sourceCount = activity.reduce((count, item) => count + item.sources.length, 0);
   return <details className="search-activity" open>
     <summary><span className="activity-pulse" />{phase ?? "Research activity"}<span className="activity-count">{activity.length} {activity.length === 1 ? "search" : "searches"}{sourceCount ? ` · ${sourceCount} sources` : ""}</span></summary>
     <div className="activity-list">{activity.map((item) => <section key={item.id} className="activity-query">
-      <div className="activity-query-title"><span className={`activity-state activity-state-${item.status}`} />{item.status === "searching" ? "Searching" : item.status === "failed" ? "Search unavailable" : "Searched"}: {item.query}</div>
+      <div className="activity-query-title"><span className={`activity-state activity-state-${item.status}`} />{item.status === "searching" ? "Searching" : item.status === "failed" ? "Search unavailable" : "Searched"}: {item.query}<span className="activity-duration">{((item.durationMs ?? Math.max(0, now - (item.startedAt || now))) / 1000).toFixed(1)}s</span></div>
       {!!item.sources.length && <ul>{item.sources.map((source) => { let domain = source.url; try { domain = new URL(source.url).hostname; } catch { /* ignore malformed source */ } return <li key={`${item.id}-${source.url}`}><a href={source.url} target="_blank" rel="noreferrer">{source.title || domain}</a><span>{domain}</span></li>; })}</ul>}
     </section>)}{!activity.length && <p>Preparing your search.</p>}</div>
   </details>;
 }
 
-export default function ChatWorkspace() {
+export default function ChatWorkspace({ userId }: { userId: string }) {
   const [activeId, setActiveId] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [conversations, setConversations] = useState<SavedConversation[]>([]);
@@ -164,6 +186,9 @@ export default function ChatWorkspace() {
   const [isHydrated, setIsHydrated] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [error, setError] = useState("");
+  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+  const [activityNow, setActivityNow] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const conversationsRef = useRef(conversations);
@@ -173,30 +198,92 @@ export default function ChatWorkspace() {
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => {
+    let cancelled = false;
+    let legacyImportPendingForAccount = false;
+    const hydrateAccount = async () => {
       try {
-        const stored = JSON.parse(localStorage.getItem(CONVERSATIONS_KEY) ?? "[]") as SavedConversation[];
-        const safeStored = Array.isArray(stored) ? stored : [];
-        const savedActiveId = localStorage.getItem(ACTIVE_CONVERSATION_KEY);
-        const active = safeStored.find((conversation) => conversation.id === savedActiveId);
+        const conversationsKey = accountStorageKey(CONVERSATIONS_KEY, userId);
+        const activeKey = accountStorageKey(ACTIVE_CONVERSATION_KEY, userId);
+        let storedText = localStorage.getItem(conversationsKey);
+        let savedActiveId = localStorage.getItem(activeKey);
+        let importedLegacy = false;
+        const hasLegacyData = Boolean(localStorage.getItem(CONVERSATIONS_KEY));
+        let legacyOwner = localStorage.getItem(LEGACY_IMPORT_OWNER_KEY);
 
+        // Move the old unscoped browser data to the first account that signs in.
+        // Later accounts get a separate namespace and cannot see those chats.
+        if (hasLegacyData && localStorage.getItem(LEGACY_IMPORT_KEY) !== "complete") {
+          if (!legacyOwner) {
+            legacyOwner = userId;
+            localStorage.setItem(LEGACY_IMPORT_OWNER_KEY, userId);
+          }
+          if (!storedText && legacyOwner === userId) {
+            storedText = localStorage.getItem(CONVERSATIONS_KEY);
+            savedActiveId = localStorage.getItem(ACTIVE_CONVERSATION_KEY);
+            importedLegacy = Boolean(storedText);
+            legacyImportPendingForAccount = importedLegacy;
+          }
+        }
+
+        const stored = JSON.parse(storedText ?? "[]") as SavedConversation[];
+        const safeStored = Array.isArray(stored) ? stored.filter((item) => item && typeof item.id === "string" && Array.isArray(item.messages)) : [];
+        if (importedLegacy && safeStored.length) {
+          const response = await fetch("/api/chat/claim", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ conversationIds: safeStored.map((item) => item.id) }),
+          });
+          if (!response.ok) throw new Error("Your saved chats could not be imported. Refresh to try again.");
+        }
+        if (importedLegacy) {
+          localStorage.setItem(conversationsKey, storedText ?? "[]");
+          if (savedActiveId) localStorage.setItem(activeKey, savedActiveId);
+          localStorage.removeItem(CONVERSATIONS_KEY);
+          localStorage.removeItem(ACTIVE_CONVERSATION_KEY);
+          localStorage.removeItem(LEGACY_IMPORT_OWNER_KEY);
+          localStorage.setItem(LEGACY_IMPORT_KEY, "complete");
+        } else if (!hasLegacyData && localStorage.getItem(LEGACY_IMPORT_KEY) !== "complete") {
+          localStorage.setItem(LEGACY_IMPORT_KEY, "complete");
+        }
+        if (cancelled) return;
+        const active = safeStored.find((conversation) => conversation.id === savedActiveId);
+        setTheme(localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light");
+        setWebSearchEnabled(localStorage.getItem(WEB_SEARCH_KEY) !== "false");
         setConversations(safeStored.slice(0, 30));
         if (active) {
           setActiveId(active.id);
-          setMessages(active.messages ?? []);
+          setMessages(active.messages);
         } else {
           const id = makeId();
           setActiveId(id);
-          localStorage.setItem(ACTIVE_CONVERSATION_KEY, id);
+          localStorage.setItem(activeKey, id);
         }
-      } catch {
-        setActiveId(makeId());
+      } catch (caught) {
+        if (!cancelled) {
+          const pendingOwner = localStorage.getItem(LEGACY_IMPORT_OWNER_KEY);
+          legacyImportPendingForAccount = pendingOwner === userId && Boolean(localStorage.getItem(CONVERSATIONS_KEY));
+          if (!legacyImportPendingForAccount) setActiveId(makeId());
+          setError(caught instanceof Error ? caught.message : "Could not load this account's research.");
+        }
       } finally {
-        setIsHydrated(true);
+        if (!cancelled && !legacyImportPendingForAccount) setIsHydrated(true);
       }
-    }, 0);
-    return () => window.clearTimeout(timeout);
-  }, []);
+    };
+    void hydrateAccount();
+    return () => { cancelled = true; };
+  }, [userId]);
+
+  useEffect(() => {
+    if (!isHydrated) return;
+    localStorage.setItem(THEME_KEY, theme);
+    localStorage.setItem(WEB_SEARCH_KEY, String(webSearchEnabled));
+  }, [isHydrated, theme, webSearchEnabled]);
+
+  useEffect(() => {
+    if (!isStreaming) return;
+    const timer = window.setInterval(() => setActivityNow(Date.now()), 200);
+    return () => window.clearInterval(timer);
+  }, [isStreaming]);
 
   useEffect(() => {
     if (!isHydrated || !activeId) return;
@@ -208,14 +295,14 @@ export default function ChatWorkspace() {
           : conversationsRef.current.filter((conversation) => conversation.id !== activeId);
         const limited = updated.slice(0, 30);
         setConversations(limited);
-        localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(limited));
-        localStorage.setItem(ACTIVE_CONVERSATION_KEY, activeId);
+        localStorage.setItem(accountStorageKey(CONVERSATIONS_KEY, userId), JSON.stringify(limited));
+        localStorage.setItem(accountStorageKey(ACTIVE_CONVERSATION_KEY, userId), activeId);
       } catch {
         setError("This browser could not save local conversation history.");
       }
     }, 250);
     return () => window.clearTimeout(timeout);
-  }, [activeId, isHydrated, messages]);
+  }, [activeId, isHydrated, messages, userId]);
 
   useEffect(() => {
     const scrollNode = scrollRef.current;
@@ -255,6 +342,30 @@ export default function ChatWorkspace() {
     setIsSidebarOpen(false);
   }, [isStreaming]);
 
+  const deleteConversation = useCallback(async (conversation: SavedConversation) => {
+    if (!window.confirm(`Delete “${conversation.title}”? Its saved messages and research for this chat will be removed.`)) return;
+    if (conversation.id === activeIdRef.current) abortRef.current?.abort();
+    try {
+      const response = await fetch("/api/chat", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId: conversation.id }) });
+      if (!response.ok && response.status !== 404) throw new Error("Could not delete this saved chat.");
+      const updated = conversationsRef.current.filter((item) => item.id !== conversation.id);
+      conversationsRef.current = updated;
+      setConversations(updated);
+      localStorage.setItem(accountStorageKey(CONVERSATIONS_KEY, userId), JSON.stringify(updated));
+      if (conversation.id === activeIdRef.current) {
+        const nextId = makeId();
+        activeIdRef.current = nextId;
+        setActiveId(nextId);
+        setMessages([]);
+        setIsStreaming(false);
+        localStorage.setItem(accountStorageKey(ACTIVE_CONVERSATION_KEY, userId), nextId);
+      }
+      setError("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not delete this saved chat.");
+    }
+  }, [userId]);
+
   const sendMessage = useCallback(async (text = input) => {
     const content = text.trim();
     if (!content || isStreaming) return;
@@ -276,7 +387,7 @@ export default function ChatWorkspace() {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: content, conversationId, streamMode: "events", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
+        body: JSON.stringify({ message: content, conversationId, streamMode: "events", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, webSearchEnabled }),
         signal: controller.signal,
       });
 
@@ -306,13 +417,14 @@ export default function ChatWorkspace() {
           setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: answer, phase: "Writing answer" } : message));
         } else if (item.type === "search-start") {
           const queries = (item.queries ?? []).filter((query): query is string => typeof query === "string");
-          updateActivity((activity) => [...activity, ...queries.map((query) => ({ id: makeId(), query, status: "searching" as const, sources: [] }))], "Searching the web");
+          const startedAt = Date.now();
+          updateActivity((activity) => [...activity, ...queries.map((query) => ({ id: makeId(), query, status: "searching" as const, startedAt, sources: [] }))], "Searching the web");
         } else if (item.type === "search-results") {
           const results = Array.isArray(item.results) ? item.results as Array<{ searchQuery?: string; title?: string; url?: string; error?: string }> : [];
           updateActivity((activity) => activity.map((entry) => {
             const matching = results.filter((result) => result.searchQuery === entry.query);
             if (!matching.length) return entry;
-            return { ...entry, status: matching.some((result) => result.url) ? "complete" : "failed", sources: matching.flatMap((result) => result.url ? [{ title: result.title ?? result.url, url: result.url }] : []) };
+            return { ...entry, status: matching.some((result) => result.url) ? "complete" : "failed", durationMs: Date.now() - entry.startedAt, sources: matching.flatMap((result) => result.url ? [{ title: result.title ?? result.url, url: result.url }] : []) };
           }), "Reviewing sources");
         } else if (item.type === "done") {
           setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, phase: undefined } : message));
@@ -344,16 +456,23 @@ export default function ChatWorkspace() {
         setIsStreaming(false);
       }
     }
-  }, [input, isStreaming]);
+  }, [input, isStreaming, webSearchEnabled]);
 
   const currentTitle = messages.length ? firstQuestion(messages) : "New research";
   const composer = (
     <div className={`composer-area${messages.length === 0 ? " composer-area-centered" : ""}`}>
-      {messages.length > 0 && error && <div className="composer-error" role="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
+      {error && <div className="composer-error" role="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
       <form className="composer" onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}>
         <label className="sr-only" htmlFor="research-question">Ask Minimi a research question</label>
         <textarea id="research-question" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Ask a question or revisit something you researched…" rows={1} disabled={!isHydrated} />
-        <div className="composer-footer"><span className="composer-hint"><Icon name="clock" size={14} /> Past research stays attached to this conversation</span>
+        <div className="composer-footer">
+          <div className="composer-options">
+            <label className={`web-search-toggle${webSearchEnabled ? " web-search-enabled" : ""}`} title="When on, Minimi may search the public web for current information.">
+              <input type="checkbox" checked={webSearchEnabled} onChange={(event) => setWebSearchEnabled(event.target.checked)} />
+              <Icon name="web" size={15} /><span>Web search</span><span className="toggle-state">{webSearchEnabled ? "On" : "Off"}</span>
+            </label>
+            <span className="composer-hint"><Icon name="clock" size={14} /> Past research stays attached to this conversation</span>
+          </div>
           {isStreaming ? <button type="button" className="send-button stop-button" onClick={() => abortRef.current?.abort()} aria-label="Stop response"><Icon name="stop" size={17} /></button> : <button type="submit" className="send-button" disabled={!input.trim()} aria-label="Send question"><Icon name="send" size={17} /></button>}
         </div>
       </form>
@@ -362,7 +481,7 @@ export default function ChatWorkspace() {
   );
 
   return (
-    <div className="minimi-shell">
+    <div className="minimi-shell" data-theme={theme}>
       {isSidebarOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setIsSidebarOpen(false)} />}
       <aside className={`workspace-sidebar${isSidebarOpen ? " workspace-sidebar-open" : ""}`}>
         <a className="brand-lockup" href="#home" aria-label="Minimi home">
@@ -382,18 +501,16 @@ export default function ChatWorkspace() {
         </div>
         <nav className="conversation-list" aria-label="Recent research">
           {conversations.length ? conversations.map((conversation) => (
-            <button
-              key={conversation.id}
-              className={`conversation-item${conversation.id === activeId ? " conversation-item-active" : ""}`}
-              onClick={() => openConversation(conversation)}
-              title={conversation.title}
-            >
-              <span className="conversation-item-icon"><Icon name="clock" size={15} /></span>
-              <span className="conversation-item-copy">
-                <span className="conversation-title">{conversation.title}</span>
-                <span className="conversation-date">{formatDate(conversation.updatedAt)}</span>
-              </span>
-            </button>
+            <div key={conversation.id} className={`conversation-row${conversation.id === activeId ? " conversation-row-active" : ""}`}>
+              <button className="conversation-item" onClick={() => openConversation(conversation)} title={conversation.title}>
+                <span className="conversation-item-icon"><Icon name="clock" size={15} /></span>
+                <span className="conversation-item-copy">
+                  <span className="conversation-title">{conversation.title}</span>
+                  <span className="conversation-date">{formatDate(conversation.updatedAt)}</span>
+                </span>
+              </button>
+              <button className="conversation-delete" title={`Delete ${conversation.title}`} aria-label={`Delete ${conversation.title}`} onClick={() => void deleteConversation(conversation)}><Icon name="trash" size={15} /></button>
+            </div>
           )) : (
             <p className="sidebar-empty">Your saved questions will appear here.</p>
           )}
@@ -408,7 +525,7 @@ export default function ChatWorkspace() {
             </div>
           </div>
           <div className="profile-row">
-            <span className="profile-avatar">M</span>
+            <UserButton />
             <span className="profile-copy"><strong>My workspace</strong><small>Recent threads on this device</small></span>
             <span className="profile-menu" aria-hidden="true">•••</span>
           </div>
@@ -425,7 +542,10 @@ export default function ChatWorkspace() {
             <span className="breadcrumb-slash">/</span>
             <span className="breadcrumb-current">{currentTitle.length > 36 ? `${currentTitle.slice(0, 36)}…` : currentTitle}</span>
           </div>
-          <div className="topbar-status"><span className="status-dot" /> Evidence mode</div>
+          <div className="topbar-actions">
+            <span className="topbar-status"><span className="status-dot" /> {webSearchEnabled ? "Web search on" : "Web search off"}</span>
+            <button className="theme-button" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}><Icon name={theme === "dark" ? "sun" : "moon"} size={17} /></button>
+          </div>
         </header>
 
         <section className="conversation-stage" aria-label="Conversation">
@@ -446,15 +566,6 @@ export default function ChatWorkspace() {
 
                 {composer}
 
-                <div className="suggestion-list" aria-label="Try a research question">
-                  {suggestions.map((suggestion) => (
-                    <button key={suggestion.label} className="suggestion-row" onClick={() => void sendMessage(suggestion.prompt)}>
-                      <span className="suggestion-icon"><Icon name={suggestion.icon} size={18} /></span>
-                      <span className="suggestion-copy"><strong>{suggestion.label}</strong><span>{suggestion.prompt}</span></span>
-                      <span className="suggestion-arrow"><Icon name="arrow" size={17} /></span>
-                    </button>
-                  ))}
-                </div>
               </div>
             ) : (
               <div className="message-thread">
@@ -466,7 +577,7 @@ export default function ChatWorkspace() {
                     ) : null}
                     <div className="message-body">
                       {message.role === "assistant" && <div className="message-author">Minimi <span>Research assistant</span></div>}
-                        {message.role === "assistant" && <SearchActivityView activity={message.activity ?? []} phase={message.phase} />}
+                      {message.role === "assistant" && <SearchActivityView activity={message.activity ?? []} phase={message.phase} now={activityNow} />}
                       {message.content ? <MessageText content={message.content} /> : (
                         <div className="thinking-indicator"><span /><span /><span /><span>Working on your answer</span></div>
                       )}

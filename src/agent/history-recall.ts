@@ -68,3 +68,35 @@ export function dateWindowUtc(date: CalendarDate) {
 export function sameDate(left: CalendarDate | null, right: CalendarDate) {
   return !!left && left.year === right.year && left.month === right.month && left.day === right.day;
 }
+
+type RecallRow = { id: number | string; conversation_id: string; role: string; content: string; created_at: string };
+
+function isFailedRecallAnswer(answer: string) {
+  return /(?:don't|do not|cannot|can't) have access to (?:your )?(?:any )?(?:previous|other|past|separate)|no (?:history|record|saved conversation)|if you remember any specific|feel free to share (?:it|them|any specific)/i.test(answer);
+}
+
+export function selectRecallTurns(rows: RecallRow[], topic: string, limit = 5) {
+  const terms = [...new Set((topic.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? []).filter((term) => term.length > 2))];
+  const conversations = new Map<string, RecallRow[]>();
+  for (const row of rows) {
+    const group = conversations.get(row.conversation_id) ?? [];
+    group.push(row);
+    conversations.set(row.conversation_id, group);
+  }
+
+  const turns: Array<{ conversationId: string; question: string; answer: string; createdAt: string; score: number }> = [];
+  for (const [conversationId, conversationRows] of conversations) {
+    conversationRows.sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+    conversationRows.forEach((row, index) => {
+      if (row.role !== "user" || isHistoryRecallQuestion(row.content)) return;
+      const question = row.content.trim();
+      const matchedTerms = terms.filter((term) => question.toLocaleLowerCase("en-US").includes(term));
+      if (terms.length && matchedTerms.length === 0) return;
+      const answerRow = conversationRows.slice(index + 1).find((candidate) => candidate.role === "assistant");
+      const answer = answerRow?.content.trim() ?? "";
+      if (isFailedRecallAnswer(answer)) return;
+      turns.push({ conversationId, question, answer, createdAt: row.created_at, score: matchedTerms.length * 10 + (answer ? 1 : 0) });
+    });
+  }
+  return turns.sort((a, b) => b.score - a.score || String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, limit);
+}

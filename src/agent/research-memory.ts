@@ -165,6 +165,7 @@ export async function findRelevantResearch(ownerId: string, query: string, tempo
 }
 
 export async function recordResearch(input: {
+  userId: string;
   conversationId: string;
   question: string;
   answer: string;
@@ -205,6 +206,7 @@ ${JSON.stringify(promptEvidence)}`,
   const supported = filterSupportedObservations(object, input.searchHits);
 
   const session = await saveResearchSession({
+    userId: input.userId,
     conversationId: input.conversationId,
     topic: input.question.trim().slice(0, 300),
     summary: input.answer.trim().slice(0, 2000),
