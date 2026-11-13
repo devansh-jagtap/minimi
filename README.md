@@ -32,7 +32,7 @@ bun run start
 
 Copy the R2 variables from `.env.example` into the server's local environment and create a private R2 bucket plus a bucket-scoped S3 API token with object read/write access. Set bucket CORS to the exact Minimi app origin and permit `PUT` with `Content-Type`. Never commit or paste `R2_SECRET_ACCESS_KEY` into chat.
 
-Run `bun run worker` in a second terminal while testing uploads. The worker reads queued files from R2, extracts text, creates page/section-aware chunks and embeddings, and makes them available only to the owning user in the conversation where they were uploaded. The upload limit is 25 MiB; supported types are PDF, DOCX, TXT, PNG, JPEG, and WebP.
+`bun run dev` starts both Next.js and the local document worker, so uploads begin processing automatically. The worker reads queued files from R2, extracts text, creates page/section-aware chunks and embeddings, and makes them searchable across chats for the owning user only. The upload limit is 25 MiB; supported types are PDF, DOCX, TXT, PNG, JPEG, and WebP. Remove a file from the composer before sending to delete it from storage and indexing. If you run `bun run dev:web` by itself, start the worker separately with `bun run worker`.
 
 The production build uses Next.js webpack mode. The document worker is a separate local process; deploy it as a long-running worker alongside the web app when hosting document processing.
 
