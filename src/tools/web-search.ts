@@ -74,7 +74,10 @@ type SearchFailure = {
 
 type SearchResult = SearchHit | SearchFailure;
 
-export function createWebSearchTool(onResults?: (hits: SearchHit[]) => void) {
+export function createWebSearchTool(
+  onResults?: (hits: SearchHit[]) => void,
+  onSearchCall?: (queryCount: number) => void,
+) {
   return tool({
   description: `
     Search the public web for current and historical information.
@@ -100,6 +103,8 @@ export function createWebSearchTool(onResults?: (hits: SearchHit[]) => void) {
 
     execute: async ({ queries }): Promise<SearchResult[]> => {
     const uniqueQueries = [...new Set(queries)];
+    onSearchCall?.(uniqueQueries.length);
+    const startedAt = Date.now();
 
     console.info(
       `[Minimi] Tavily started: ${uniqueQueries.length} queries`
@@ -119,7 +124,7 @@ export function createWebSearchTool(onResults?: (hits: SearchHit[]) => void) {
     );
 
     console.info(
-      `[Minimi] Tavily completed: ${successful}/${uniqueQueries.length} successful searches, ${totalResults} results`
+      `[Minimi] Tavily completed: ${successful}/${uniqueQueries.length} successful searches, ${totalResults} results in ${Date.now() - startedAt}ms`
     );
     const output: SearchResult[] = [];
 

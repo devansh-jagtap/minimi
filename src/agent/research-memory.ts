@@ -117,7 +117,7 @@ function temporalMatch(query: string, timestamp: string) {
   return observedDate === latest.getTime() || observedDate === lastWeek.getTime();
 }
 
-export async function findRelevantResearch(conversationId: string, query: string) {
+export async function findRelevantResearch(conversationId: string, query: string, temporalQuery = query) {
   const sessions = await findResearchSessions({ conversationId, limit: 50 });
   if (!sessions.length) return [];
 
@@ -134,7 +134,7 @@ export async function findRelevantResearch(conversationId: string, query: string
     );
     const topicTerms = terms(`${String(session.topic)} ${String(session.summary)}`);
     const topicMatches = [...queryTerms].filter((term) => topicTerms.has(term));
-    const isDateMatch = temporalMatch(query, String(session.researched_at));
+    const isDateMatch = temporalMatch(temporalQuery, String(session.researched_at));
     return { session, sessionObservations, entityMatches, topicMatches, isDateMatch, score: entityMatches.length * 3 + topicMatches.length + (isDateMatch ? 10 : 0) };
   }).filter((item) => item.isDateMatch || item.entityMatches.length > 0 || item.topicMatches.length >= 2)
     .sort((a, b) => b.score - a.score || String(b.session.researched_at).localeCompare(String(a.session.researched_at)))
@@ -146,7 +146,7 @@ export async function findRelevantResearch(conversationId: string, query: string
       summary: String(session.summary),
       researchedAt: String(session.researched_at),
     },
-    observations: sessionObservations.map((observation) => ({
+    observations: sessionObservations.slice(0, 8).map((observation) => ({
       entity: String(observation.display_name),
       entityType: String(observation.entity_type),
       attribute: String(observation.attribute),
