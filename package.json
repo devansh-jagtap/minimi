@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "bun run scripts/dev.ts",
+    "dev:web": "next dev",
     "build": "next build --webpack",
     "start": "next start",
     "worker": "bun run src/lib/document-worker.ts",
