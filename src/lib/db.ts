@@ -340,6 +340,8 @@ export async function deleteConversation(userId: string, conversationId: string)
       }
       await transaction.execute({ sql: "DELETE FROM research_sessions WHERE conversation_id = ? AND user_id = ?", args: [conversationId, userId] });
       await transaction.execute({ sql: "DELETE FROM memory_items WHERE source_conversation_id = ? AND user_id = ?", args: [conversationId, userId] });
+      await transaction.execute({ sql: "DELETE FROM document_chunks WHERE document_id IN (SELECT id FROM documents WHERE conversation_id = ? AND user_id = ?)", args: [conversationId, userId] });
+      await transaction.execute({ sql: "DELETE FROM documents WHERE conversation_id = ? AND user_id = ?", args: [conversationId, userId] });
       await transaction.execute({ sql: "DELETE FROM messages WHERE conversation_id = ?", args: [conversationId] });
       await transaction.execute({ sql: "DELETE FROM conversations WHERE id = ? AND user_id = ?", args: [conversationId, userId] });
       await transaction.execute("DELETE FROM sources WHERE NOT EXISTS (SELECT 1 FROM observations WHERE observations.source_id = sources.id)");

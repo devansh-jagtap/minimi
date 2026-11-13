@@ -2,12 +2,16 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { auth } from "@clerk/nextjs/server";
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 
 import { runResearchAgent } from "@/agent/orchestrator";
 import { findRelevantResearch, recordResearch } from "@/agent/research-memory";
+import { retrieveDocumentContext } from "@/lib/document-processing";
+import { getDocumentBucket, getObjectStorageClient } from "@/lib/object-storage";
 import { dateWindowUtc, formatCalendarDate, historyRecallTopic, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate, selectRecallTurns } from "@/agent/history-recall";
 import type { SearchHit } from "@/tools/web-search";
 import {
+  db,
   ensureSchema,
   saveMessage,
   getRecentMessages,
@@ -39,6 +43,10 @@ export async function DELETE(request: Request) {
     if (!userId) return Response.json({ error: "Sign in to manage your research." }, { status: 401 });
     const { conversationId } = DeleteSchema.parse(await request.json());
     await ensureSchema();
+    const documentRows = await db.execute({ sql: "SELECT object_key FROM documents WHERE conversation_id = ? AND user_id = ?", args: [conversationId, userId] });
+    for (const row of documentRows.rows) {
+      await getObjectStorageClient().send(new DeleteObjectCommand({ Bucket: getDocumentBucket(), Key: String(row.object_key) }));
+    }
     const deleted = await deleteConversation(userId, conversationId);
     return Response.json({ deleted }, { status: deleted ? 200 : 404 });
   } catch (error) {
@@ -118,6 +126,7 @@ export async function POST(request: Request) {
       .map((message) => message.content)
       .join("\n");
     let historicalContext: string | undefined;
+    let documentContext: string | undefined;
     const retrievalStartedAt = Date.now();
     try {
       const priorResearch = await findRelevantResearch(userId, retrievalQuery, body.message, true, timeZone);
@@ -128,6 +137,13 @@ export async function POST(request: Request) {
     } catch (error) {
       console.error("[Minimi] Historical research retrieval failed:", error);
     }
+    try {
+      const documents = await retrieveDocumentContext(userId, conversationId, body.message);
+      if (documents.context) documentContext = JSON.stringify({ excerpts: documents.context, citations: documents.citations });
+    } catch (error) {
+      console.error("[Minimi] Document retrieval failed:", error instanceof Error ? error.message : "unknown error");
+    }
+    if (documentContext) historicalContext = [historicalContext, `DOCUMENT EXCERPTS AND CITATIONS:\n${documentContext}`].filter(Boolean).join("\n\n");
     console.info(`[Minimi] Memory retrieval completed in ${Date.now() - retrievalStartedAt}ms`);
 
     // Run the agent and persist its final response.
