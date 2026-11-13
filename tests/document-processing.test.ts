@@ -112,7 +112,7 @@ describe("document extraction and chunking", () => {
 });
 
 describe("document retrieval scope and citations", () => {
-  it("ranks matching chunks while filtering by both owner and conversation", async () => {
+  it("recalls relevant files across the owner's chats without exposing another owner's files", async () => {
     await dbModule.db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: ["doc-owner-a"] });
     await dbModule.db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: ["doc-owner-b"] });
     await dbModule.db.execute({ sql: "INSERT OR IGNORE INTO conversations (id, user_id) VALUES (?, ?)", args: ["doc-conv-a", "doc-owner-a"] });
@@ -140,10 +140,14 @@ describe("document retrieval scope and citations", () => {
     const result = await docs.retrieveDocumentContext("doc-owner-a", "doc-conv-a", "Pro price monthly", {
       embed: async () => [[1, 0]], minScore: 0.05,
     });
-    expect(result.citations).toEqual([{ documentId: "doc-a", filename: "pricing.pdf", pageNumber: 3, sectionHeading: undefined }]);
+    expect(result.citations).toEqual([
+      { documentId: "doc-a", filename: "pricing.pdf", pageNumber: 3, sectionHeading: undefined },
+      { documentId: "doc-b", filename: "other-chat.txt", pageNumber: undefined, sectionHeading: undefined },
+    ]);
     expect(result.context).toContain("Untrusted document excerpt: pricing.pdf · page 3");
     expect(result.context).toContain("$19 monthly");
-    expect(result.context).not.toContain("$999");
+    expect(result.context).toContain("Untrusted document excerpt: other-chat.txt · from another chat");
+    expect(result.context).toContain("$999");
     expect(result.context).not.toContain("$888");
   });
 });

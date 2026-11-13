@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { auth } from "@clerk/nextjs/server";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { after } from "next/server";
 
 import { runResearchAgent } from "@/agent/orchestrator";
 import { findRelevantResearch, recordResearch } from "@/agent/research-memory";
@@ -125,31 +126,82 @@ export async function POST(request: Request) {
       .slice(-8)
       .map((message) => message.content)
       .join("\n");
-    let historicalContext: string | undefined;
-    let documentContext: string | undefined;
-    const retrievalStartedAt = Date.now();
-    try {
-      const priorResearch = await findRelevantResearch(userId, retrievalQuery, body.message, true, timeZone);
-      const priorMemories = await findRelevantMemoryItems(userId, body.message);
-      if (priorResearch.length || priorMemories.length) {
-        historicalContext = JSON.stringify({ storedEvidence: priorResearch, durableMemories: priorMemories });
-      }
-    } catch (error) {
-      console.error("[Minimi] Historical research retrieval failed:", error);
-    }
-    try {
-      const documents = await retrieveDocumentContext(userId, conversationId, body.message);
-      if (documents.context) documentContext = JSON.stringify({ excerpts: documents.context, citations: documents.citations });
-    } catch (error) {
-      console.error("[Minimi] Document retrieval failed:", error instanceof Error ? error.message : "unknown error");
-    }
-    if (documentContext) historicalContext = [historicalContext, `DOCUMENT EXCERPTS AND CITATIONS:\n${documentContext}`].filter(Boolean).join("\n\n");
-    console.info(`[Minimi] Memory retrieval completed in ${Date.now() - retrievalStartedAt}ms`);
+    const documentQuestion = /\b(file|document|attachment|pdf|resume|spreadsheet)\b/i.test(body.message);
+    const attachedDocuments = documentQuestion
+      ? await db.execute({
+          sql: "SELECT filename, status FROM documents WHERE user_id = ? AND conversation_id = ? ORDER BY created_at DESC LIMIT 10",
+          args: [userId, conversationId],
+        })
+      : { rows: [] };
+    const historicalStartedAt = Date.now();
+    const documentStartedAt = Date.now();
+    const [historicalResult, documentContext] = await Promise.all([
+      (async () => {
+        try {
+          const [priorResearch, priorMemories] = await Promise.all([
+            findRelevantResearch(userId, retrievalQuery, body.message, true, timeZone),
+            findRelevantMemoryItems(userId, body.message),
+          ]);
+          return priorResearch.length || priorMemories.length
+            ? JSON.stringify({ storedEvidence: priorResearch, durableMemories: priorMemories })
+            : undefined;
+        } catch (error) {
+          console.error("[Minimi] Historical research retrieval failed:", error);
+          return undefined;
+        } finally {
+          console.info(`[Minimi] Historical evidence and memory lookup completed in ${Date.now() - historicalStartedAt}ms`);
+        }
+      })(),
+      (async () => {
+        try {
+          const documents = await retrieveDocumentContext(userId, conversationId, body.message, {
+            minScore: documentQuestion ? 0 : undefined,
+          });
+          return documents.context ? JSON.stringify({ excerpts: documents.context, citations: documents.citations }) : undefined;
+        } catch (error) {
+          console.error("[Minimi] Document retrieval failed:", error instanceof Error ? error.message : "unknown error");
+          return undefined;
+        } finally {
+          console.info(`[Minimi] Document retrieval completed in ${Date.now() - documentStartedAt}ms`);
+        }
+      })(),
+    ]);
+    let historicalContext = historicalResult;
 
+    if (documentQuestion && attachedDocuments.rows.length && !documentContext) {
+      const files = attachedDocuments.rows.map((row) => ({
+        filename: String(row.filename),
+        status: String(row.status),
+      }));
+      const pendingFiles = files.filter((file) => ["uploaded", "queued", "processing"].includes(file.status));
+      const failedFiles = files.filter((file) => file.status === "failed");
+      const filenames = (pendingFiles.length ? pendingFiles : failedFiles.length ? failedFiles : files)
+        .map((file) => file.filename)
+        .join(", ");
+      const answer = pendingFiles.length
+        ? `I can see ${filenames} attached to this chat, but it is still being processed. I can read it after its status changes to completed. Please ask again then.`
+        : failedFiles.length
+          ? `I can see ${filenames} attached, but processing failed. Use Retry beside the file, then ask again after its status changes to completed.`
+          : `I can see ${filenames} attached and processing is complete, but I could not retrieve readable passages for this question. Try asking about a specific section or phrase.`;
+      await saveMessage(conversationId, "assistant", answer, userId);
+      const responseBody = body.streamMode === "events"
+        ? `${event({ type: "delta", text: answer })}${event({ type: "done" })}`
+        : answer;
+      return new Response(responseBody, {
+        headers: {
+          "Content-Type": body.streamMode === "events" ? "application/x-ndjson; charset=utf-8" : "text/plain; charset=utf-8",
+          "X-Conversation-Id": conversationId,
+          "Cache-Control": "no-cache, no-transform",
+        },
+      });
+    }
+
+    if (documentContext) historicalContext = [historicalContext, `DOCUMENT EXCERPTS AND CITATIONS:\n${documentContext}`].filter(Boolean).join("\n\n");
     // Run the agent and persist its final response.
     const searchHits: SearchHit[] = [];
     let modelCallCount = 0;
     let searchCallCount = 0;
+    let completedAnswer: string | undefined;
     const result = runResearchAgent(messages, {
       abortSignal: request.signal,
       onSearchResults: (hits) => searchHits.push(...hits),
@@ -179,20 +231,28 @@ export async function POST(request: Request) {
         } catch (error) {
           console.error("[Minimi] Global memory save failed:", error);
         }
-        try {
-          await recordResearch({
-            userId,
-            conversationId,
-            question: body.message,
-            answer: text,
-            searchHits,
-            abortSignal: AbortSignal.timeout(12000),
-          });
-        } catch (error) {
-          console.error("[Minimi] Research memory extraction failed:", error);
-        }
-        console.info(`[Minimi] Request completed in ${Date.now() - requestStartedAt}ms; chat model steps ${modelCallCount}; extraction call ${searchHits.length ? "attempted" : "skipped"}; Tavily queries ${searchCallCount}`);
+        completedAnswer = text;
+        console.info(`[Minimi] Answer ready in ${Date.now() - requestStartedAt}ms; chat model steps ${modelCallCount}; Tavily queries ${searchCallCount}`);
       },
+    });
+
+    // Observation extraction calls Gemini a second time. Run it after the
+    // streamed answer has reached the user so research memory cannot hold the
+    // chat response open for several additional seconds.
+    after(async () => {
+      if (!completedAnswer || searchHits.length === 0) return;
+      try {
+        await recordResearch({
+          userId,
+          conversationId,
+          question: body.message,
+          answer: completedAnswer,
+          searchHits,
+          abortSignal: AbortSignal.timeout(12000),
+        });
+      } catch (error) {
+        console.error("[Minimi] Research memory extraction failed:", error);
+      }
     });
 
     if (body.streamMode === "events") {
