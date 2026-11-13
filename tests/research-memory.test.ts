@@ -251,13 +251,15 @@ describe("structured research persistence", () => {
 
 describe("evidence validation and comparison outcomes", () => {
   it("parses ordinal day-first dates and handles UTC messages in the user's local day", async () => {
-    const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, isHistoryRecallQuestion } = await import("../src/agent/history-recall");
+    const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion } = await import("../src/agent/history-recall");
     const date = parseRecallDate("what we discussed about Meta on 13th nov", "Asia/Kolkata", new Date("2026-11-13T00:00:00Z"));
 
     expect(date).toEqual({ year: 2026, month: 10, day: 13 });
     expect(sameDate(localDateParts("2026-11-12 21:17:03", "Asia/Kolkata"), date!)).toBe(true);
     expect(dateWindowUtc(date!)).toEqual({ startUtc: "2026-11-12 00:00:00", endUtc: "2026-11-15 00:00:00" });
     expect(isHistoryRecallQuestion("what we discussed about the meta on 13th nov")).toBe(true);
+    expect(historyRecallTopic("What did I ask you on 3 November?")).toBe("");
+    expect(historyRecallTopic("what we discussed about the meta on 13th nov")).toBe("meta");
   });
 
   it("discards invalid extraction output and unsupported source claims", async () => {

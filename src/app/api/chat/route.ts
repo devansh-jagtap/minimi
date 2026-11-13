@@ -4,7 +4,7 @@ import { z } from "zod";
 
 import { runResearchAgent } from "@/agent/orchestrator";
 import { findRelevantResearch, recordResearch } from "@/agent/research-memory";
-import { dateWindowUtc, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate } from "@/agent/history-recall";
+import { dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate } from "@/agent/history-recall";
 import type { SearchHit } from "@/tools/web-search";
 import {
   ensureSchema,
@@ -49,7 +49,7 @@ export async function POST(request: Request) {
     let recallRows: Awaited<ReturnType<typeof searchUserMessages>> = [];
     if (recallRequested) {
       const dateWindow = requestedDate ? dateWindowUtc(requestedDate) : {};
-      recallRows = await searchUserMessages({ userId: LOCAL_USER_ID, query: body.message, ...dateWindow, limit: requestedDate ? 100 : 40 });
+      recallRows = await searchUserMessages({ userId: LOCAL_USER_ID, query: requestedDate ? historyRecallTopic(body.message) : body.message, ...dateWindow, limit: requestedDate ? 100 : 40 });
       if (requestedDate) recallRows = recallRows.filter((row) => sameDate(localDateParts(String(row.created_at), timeZone), requestedDate));
     }
 

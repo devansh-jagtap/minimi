@@ -212,8 +212,8 @@ export async function searchUserMessages(input: { userId: string; query: string;
   await ensureSchema();
   const terms = [...new Set((input.query.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? []).filter((term) => term.length > 2 && !["what", "about", "with", "from", "that", "this", "were", "discussed", "talked", "asked"].includes(term)))].slice(0, 6);
   const conditions = terms.map(() => "LOWER(m.content) LIKE ?").join(" OR ");
-  if (!conditions) return [];
   const dateCondition = input.startUtc && input.endUtc ? "AND m.created_at >= ? AND m.created_at < ?" : "";
+  if (!conditions && !dateCondition) return [];
   const result = await db.execute({
     sql: `SELECT m.conversation_id, m.role, m.content, m.created_at
           FROM messages m JOIN conversations c ON c.id = m.conversation_id
