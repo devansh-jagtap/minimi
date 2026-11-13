@@ -28,6 +28,12 @@ const WEB_SEARCH_KEY = "minimi-web-search-v1";
 const LEGACY_IMPORT_KEY = "minimi-legacy-import-v1";
 const LEGACY_IMPORT_OWNER_KEY = "minimi-legacy-import-owner-v1";
 
+async function legacyConversationProof(messages: Message[]) {
+  const transcript = JSON.stringify(messages.map((message) => [message.role, message.content]));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(transcript));
+  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
 function accountStorageKey(key: string, userId: string) {
   return `${key}:${userId}`;
 }
@@ -231,9 +237,11 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
           const response = await fetch("/api/chat/claim", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ conversationIds: safeStored.map((item) => item.id) }),
+            body: JSON.stringify({ conversations: await Promise.all(safeStored.map(async (item) => ({ id: item.id, proof: await legacyConversationProof(item.messages.slice(-40)), messageCount: Math.min(item.messages.length, 40) }))) }),
           });
           if (!response.ok) throw new Error("Your saved chats could not be imported. Refresh to try again.");
+          const { claimedCount } = await response.json() as { claimedCount: number };
+          if (claimedCount !== safeStored.length) throw new Error("Some saved chats could not be verified for import. Your original local copy is still available.");
         }
         if (importedLegacy) {
           localStorage.setItem(conversationsKey, storedText ?? "[]");

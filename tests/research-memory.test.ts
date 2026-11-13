@@ -322,27 +322,42 @@ describe("structured research persistence", () => {
   });
 
   it("allows only one concurrent account to claim a legacy conversation", async () => {
-    const { claimLegacyConversations, LOCAL_USER_ID } = await import("../src/lib/db");
+    const { claimLegacyConversations, legacyConversationProof, LOCAL_USER_ID } = await import("../src/lib/db");
     await memory.db.execute({ sql: "INSERT OR IGNORE INTO conversations (id, user_id) VALUES (?, ?)", args: ["claim-race", "local-single-user"] });
+    const transcript = [{ role: "user", content: "local possession proof fixture" }];
+    await memory.db.execute({ sql: "INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)", args: ["claim-race", "user", transcript[0].content] });
+    const proof = legacyConversationProof(transcript);
     const [first, second] = await Promise.all([
-      claimLegacyConversations("claim-user-a", ["claim-race"]),
-      claimLegacyConversations("claim-user-b", ["claim-race"]),
+      claimLegacyConversations("claim-user-a", [{ id: "claim-race", proof, messageCount: 1 }]),
+      claimLegacyConversations("claim-user-b", [{ id: "claim-race", proof, messageCount: 1 }]),
     ]);
     const owner = await memory.db.execute({ sql: "SELECT user_id FROM conversations WHERE id = ?", args: ["claim-race"] });
     expect([first.length, second.length].sort()).toEqual([0, 1]);
     expect(["claim-user-a", "claim-user-b"]).toContain(String(owner.rows[0]?.user_id));
     expect(String(owner.rows[0]?.user_id)).not.toBe(LOCAL_USER_ID);
   });
+
+  it("rejects legacy claims without possession of the saved transcript", async () => {
+    const { claimLegacyConversations, LOCAL_USER_ID } = await import("../src/lib/db");
+    await memory.db.execute({ sql: "INSERT INTO conversations (id, user_id) VALUES (?, ?)", args: ["claim-proof", LOCAL_USER_ID] });
+    await memory.db.execute({ sql: "INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)", args: ["claim-proof", "user", "private legacy transcript"] });
+    const claimed = await claimLegacyConversations("attacker-account", [{ id: "claim-proof", proof: "0".repeat(64), messageCount: 1 }]);
+    const owner = await memory.db.execute({ sql: "SELECT user_id FROM conversations WHERE id = ?", args: ["claim-proof"] });
+    expect(claimed).toEqual([]);
+    expect(String(owner.rows[0]?.user_id)).toBe(LOCAL_USER_ID);
+    expect(await claimLegacyConversations("attacker-account", [{ id: "claim-proof", proof: "0".repeat(64), messageCount: 0 }])).toEqual([]);
+  });
 });
 
 describe("evidence validation and comparison outcomes", () => {
   it("parses local-day dates and weekday references across UTC boundaries", async () => {
-    const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion, selectRecallTurns } = await import("../src/agent/history-recall");
+    const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, formatCalendarDate, historyRecallTopic, isHistoryRecallQuestion, selectRecallTurns } = await import("../src/agent/history-recall");
     const date = parseRecallDate("what we discussed about Meta on 13th nov", "Asia/Kolkata", new Date("2026-11-13T00:00:00Z"));
 
     expect(date).toEqual({ year: 2026, month: 10, day: 13 });
     expect(sameDate(localDateParts("2026-11-12 21:17:03", "Asia/Kolkata"), date!)).toBe(true);
     expect(dateWindowUtc(date!, "Asia/Kolkata")).toEqual({ startUtc: "2026-11-12 18:30:00", endUtc: "2026-11-13 18:30:00" });
+    expect(formatCalendarDate(date!)).toBe("November 13, 2026");
     expect(isHistoryRecallQuestion("what we discussed about the meta on 13th nov")).toBe(true);
     expect(historyRecallTopic("What did I ask you on 3 November?")).toBe("");
     expect(historyRecallTopic("what we discussed about the meta on 13th nov")).toBe("meta");

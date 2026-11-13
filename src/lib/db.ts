@@ -1,6 +1,6 @@
 
 import { createClient } from "@libsql/client";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const url = process.env.DATABASE_URL;
 
@@ -316,22 +316,35 @@ export async function deleteConversation(userId: string, conversationId: string)
   });
 }
 
-export async function claimLegacyConversations(userId: string, conversationIds: string[]) {
+export function legacyConversationProof(messages: Array<{ role: string; content: string }>) {
+  const transcript = JSON.stringify(messages.map((message) => [message.role, message.content]));
+  return createHash("sha256").update(transcript, "utf8").digest("hex");
+}
+
+export async function claimLegacyConversations(userId: string, conversations: Array<{ id: string; proof: string; messageCount: number }>) {
   await ensureSchema();
-  const ids = [...new Set(conversationIds)].slice(0, 100);
-  if (!ids.length) return [];
+  const unique = [...new Map(conversations.filter((item) => /^[a-f0-9]{64}$/i.test(item.proof) && Number.isInteger(item.messageCount) && item.messageCount > 0 && item.messageCount <= 40).map((item) => [item.id, item])).values()].slice(0, 100);
+  if (!unique.length) return [];
   return withWriteLock(async () => {
     const transaction = await db.transaction("write");
     try {
       await transaction.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: [userId] });
-      const placeholders = ids.map(() => "?").join(",");
       const legacyOwnerIds = [...new Set([LOCAL_USER_ID, "local-single-user"])];
       const ownerPlaceholders = legacyOwnerIds.map(() => "?").join(",");
-      const candidates = await transaction.execute({
-        sql: `SELECT id FROM conversations WHERE id IN (${placeholders}) AND user_id IN (${ownerPlaceholders})`,
-        args: [...ids, ...legacyOwnerIds],
-      });
-      const claimedIds = candidates.rows.map((row) => String(row.id));
+      const claimedIds: string[] = [];
+      for (const item of unique) {
+        const candidate = await transaction.execute({
+          sql: `SELECT id, user_id FROM conversations WHERE id = ? AND (user_id = ? OR user_id IN (${ownerPlaceholders}))`,
+          args: [item.id, userId, ...legacyOwnerIds],
+        });
+        if (!candidate.rows.length) continue;
+        const messages = await transaction.execute({
+          sql: "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
+          args: [item.id, item.messageCount],
+        });
+        const transcript = messages.rows.reverse().map((row) => ({ role: String(row.role), content: String(row.content) }));
+        if (transcript.length && legacyConversationProof(transcript) === item.proof) claimedIds.push(item.id);
+      }
       if (claimedIds.length) {
         const claimedPlaceholders = claimedIds.map(() => "?").join(",");
         const args = [userId, ...claimedIds, ...legacyOwnerIds];
