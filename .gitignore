@@ -12,6 +12,7 @@
 
 # testing
 /coverage
+/data/minimi.db
 
 # next.js
 /.next/
