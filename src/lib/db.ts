@@ -320,9 +320,10 @@ export async function saveObservations(
           sql: `INSERT INTO sources (id, url, title, publisher, published_at, retrieved_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
-                  title = excluded.title, publisher = COALESCE(excluded.publisher, sources.publisher),
-                  published_at = COALESCE(excluded.published_at, sources.published_at),
-                  retrieved_at = excluded.retrieved_at`,
+                  retrieved_at = CASE
+                    WHEN excluded.retrieved_at > sources.retrieved_at THEN excluded.retrieved_at
+                    ELSE sources.retrieved_at
+                  END`,
           args: [sourceId, observation.source.url, observation.source.title, observation.source.publisher ?? null, observation.source.publishedAt ?? null, retrievedAt],
         });
         const source = await transaction.execute({ sql: "SELECT id FROM sources WHERE url = ?", args: [observation.source.url] });

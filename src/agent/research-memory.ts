@@ -23,6 +23,56 @@ const ExtractionSchema = z.object({
   })).max(12),
 });
 
+export function filterSupportedObservations(raw: unknown, hits: SearchHit[]): ResearchObservation[] {
+  const parsed = ExtractionSchema.safeParse(raw);
+  if (!parsed.success) return [];
+
+  const hitsByUrl = new Map<string, SearchHit[]>();
+  for (const hit of hits) {
+    const matching = hitsByUrl.get(hit.url) ?? [];
+    matching.push(hit);
+    hitsByUrl.set(hit.url, matching);
+  }
+
+  return parsed.data.observations.flatMap((item): ResearchObservation[] => {
+    const source = (hitsByUrl.get(item.sourceUrl) ?? []).find((hit) =>
+      hit.content.toLocaleLowerCase("en-US").includes(item.evidenceQuote.trim().toLocaleLowerCase("en-US")),
+    );
+    if (!source || (item.validFrom && !item.evidenceQuote.includes(item.validFrom))) return [];
+
+    let publisher: string;
+    try {
+      publisher = new URL(source.url).hostname.replace(/^www\./, "");
+    } catch {
+      return [];
+    }
+
+    return [{
+      entity: { name: item.entity, type: item.entityType },
+      source: { url: source.url, title: source.title, publisher, publishedAt: source.publishedDate },
+      attribute: item.attribute,
+      value: item.value,
+      validFrom: item.validFrom,
+    }];
+  });
+}
+
+export type ComparisonStatus = "confirmed change" | "no change found in available evidence" | "insufficient evidence";
+
+export function classifyObservationComparison(
+  historical?: { entity: string; attribute: string; value: string; sourceUrl: string },
+  current?: { entity: string; attribute: string; value: string; sourceUrl: string },
+): ComparisonStatus {
+  if (!historical || !current || !historical.sourceUrl || !current.sourceUrl) return "insufficient evidence";
+  const sameEntity = historical.entity.trim().toLocaleLowerCase("en-US") === current.entity.trim().toLocaleLowerCase("en-US");
+  const sameAttribute = historical.attribute.trim().toLocaleLowerCase("en-US") === current.attribute.trim().toLocaleLowerCase("en-US");
+  if (!sameEntity || !sameAttribute) return "insufficient evidence";
+  const normalizeValue = (value: string) => value.trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+  return normalizeValue(historical.value) === normalizeValue(current.value)
+    ? "no change found in available evidence"
+    : "confirmed change";
+}
+
 const STOP_WORDS = new Set([
   "a", "about", "after", "any", "are", "asked", "before", "changed", "changes",
   "did", "does", "for", "from", "has", "have", "how", "i", "in", "is", "it",
@@ -108,7 +158,7 @@ export async function findRelevantResearch(conversationId: string, query: string
         url: String(observation.url),
         publisher: observation.publisher ? String(observation.publisher) : undefined,
         publishedAt: observation.published_at ? String(observation.published_at) : undefined,
-        retrievedAt: String(observation.retrieved_at),
+        retrievedAt: String(observation.observed_at),
       },
     })),
   }));
@@ -122,6 +172,7 @@ export async function recordResearch(input: {
   abortSignal?: AbortSignal;
 }) {
   if (input.searchHits.length === 0) return;
+  const extractionStartedAt = Date.now();
 
   const retrievedAt = input.searchHits.reduce(
     (latest, hit) => hit.retrievedAt > latest ? hit.retrievedAt : latest,
@@ -149,42 +200,9 @@ Question: ${input.question.slice(0, 2000)}
 Search evidence JSON:
 ${JSON.stringify(promptEvidence)}`,
   });
+  console.info(`[Minimi] Evidence extraction completed in ${Date.now() - extractionStartedAt}ms across ${input.searchHits.length} results`);
 
-  const hitsByUrl = new Map<string, SearchHit[]>();
-  for (const hit of input.searchHits) {
-    const matching = hitsByUrl.get(hit.url) ?? [];
-    matching.push(hit);
-    hitsByUrl.set(hit.url, matching);
-  }
-
-  const supported = object.observations.flatMap((item): ResearchObservation[] => {
-    const hits = hitsByUrl.get(item.sourceUrl) ?? [];
-    const source = hits.find((hit) =>
-      hit.content.toLocaleLowerCase("en-US").includes(item.evidenceQuote.trim().toLocaleLowerCase("en-US")),
-    );
-    if (!source) return [];
-    if (item.validFrom && !item.evidenceQuote.includes(item.validFrom)) return [];
-
-    let publisher: string | undefined;
-    try {
-      publisher = new URL(source.url).hostname.replace(/^www\./, "");
-    } catch {
-      return [];
-    }
-
-    return [{
-      entity: { name: item.entity, type: item.entityType },
-      source: {
-        url: source.url,
-        title: source.title,
-        publisher,
-        publishedAt: source.publishedDate,
-      },
-      attribute: item.attribute,
-      value: item.value,
-      validFrom: item.validFrom,
-    }];
-  });
+  const supported = filterSupportedObservations(object, input.searchHits);
 
   const session = await saveResearchSession({
     conversationId: input.conversationId,
@@ -196,4 +214,5 @@ ${JSON.stringify(promptEvidence)}`,
   if (supported.length) {
     await saveObservations(session.id, supported, retrievedAt);
   }
+  console.info(`[Minimi] Research memory saved ${supported.length} supported observations`);
 }
