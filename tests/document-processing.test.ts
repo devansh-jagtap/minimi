@@ -8,6 +8,26 @@ let dbModule: typeof import("../src/lib/db");
 let docs: typeof import("../src/lib/document-processing");
 let temporaryDirectory: string;
 
+function blankPdfFixture() {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>",
+    "<< /Length 4 >>\nstream\nq Q\nendstream",
+  ];
+  let output = "%PDF-1.4\n";
+  const offsets = [0];
+  for (let index = 0; index < objects.length; index += 1) {
+    offsets.push(Buffer.byteLength(output, "binary"));
+    output += (index + 1) + " 0 obj\n" + objects[index] + "\nendobj\n";
+  }
+  const xrefOffset = Buffer.byteLength(output, "binary");
+  output += "xref\n0 " + (objects.length + 1) + "\n0000000000 65535 f \n";
+  for (const offset of offsets.slice(1)) output += offset.toString().padStart(10, "0") + " 00000 n \n";
+  output += "trailer\n<< /Root 1 0 R /Size " + (objects.length + 1) + " >>\nstartxref\n" + xrefOffset + "\n%%EOF";
+  return new Uint8Array(Buffer.from(output, "binary"));
+}
+
 beforeAll(async () => {
   temporaryDirectory = mkdtempSync(join(tmpdir(), "minimi-document-test-"));
   vi.stubEnv("DATABASE_URL", pathToFileURL(join(temporaryDirectory, "documents.db")).href);
@@ -66,6 +86,13 @@ describe("document extraction and chunking", () => {
       expect(blocks[0]?.text).toContain(mimeType);
     }
     expect(vision).toHaveBeenCalledTimes(3);
+  });
+
+  it("renders text-empty PDF pages through the scanned-page OCR fallback", async () => {
+    const vision = vi.fn(async () => "Scanned invoice total is $42.");
+    const blocks = await docs.extractDocumentBlocks(blankPdfFixture(), "application/pdf", { vision });
+    expect(blocks).toEqual([{ text: "Scanned invoice total is $42.", pageNumber: 1 }]);
+    expect(vision).toHaveBeenCalledOnce();
   });
 
   it("stores idempotent-ready embeddings and hashes from injected deterministic vectors", async () => {
