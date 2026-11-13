@@ -22,11 +22,11 @@ const ExtractionSchema = z.object({
     evidenceQuote: z.string().min(15).max(600),
     validFrom: z.string().date().optional(),
     comparison: z.object({
-      planTier: z.string().min(1).max(100).optional(),
-      currency: z.string().min(1).max(8).optional(),
-      billingInterval: z.string().min(1).max(40).optional(),
-      priceBasis: z.string().min(1).max(100).optional(),
-      region: z.string().min(1).max(100).optional(),
+      planTier: z.string().max(100).optional(),
+      currency: z.string().max(8).optional(),
+      billingInterval: z.string().max(40).optional(),
+      priceBasis: z.string().max(100).optional(),
+      region: z.string().max(100).optional(),
     }).optional(),
   })).max(12),
 });
@@ -121,7 +121,13 @@ export function filterSupportedObservations(raw: unknown, hits: SearchHit[]): Re
       attribute: item.attribute,
       value: item.value,
       validFrom: item.validFrom,
-      comparison: item.comparison,
+      comparison: item.comparison ? {
+        planTier: item.comparison.planTier?.trim() || undefined,
+        currency: item.comparison.currency?.trim() || undefined,
+        billingInterval: item.comparison.billingInterval?.trim() || undefined,
+        priceBasis: item.comparison.priceBasis?.trim() || undefined,
+        region: item.comparison.region?.trim() || undefined,
+      } : undefined,
     }];
   });
 }
