@@ -4,7 +4,7 @@ import type { ModelMessage } from "ai";
 import { z } from "zod";
 
 import { runResearchAgent } from "@/agent/orchestrator";
-import { recordResearch } from "@/agent/research-memory";
+import { findRelevantResearch, recordResearch } from "@/agent/research-memory";
 import type { SearchHit } from "@/tools/web-search";
 import {
   ensureSchema,
@@ -51,11 +51,25 @@ export async function POST(request: Request) {
   content: String(row.content),
 }));
 
+    const retrievalQuery = messages
+      .filter((message) => message.role === "user")
+      .slice(-8)
+      .map((message) => message.content)
+      .join("\n");
+    let historicalContext: string | undefined;
+    try {
+      const priorResearch = await findRelevantResearch(conversationId, retrievalQuery);
+      if (priorResearch.length) historicalContext = JSON.stringify(priorResearch);
+    } catch (error) {
+      console.error("[Minimi] Historical research retrieval failed:", error);
+    }
+
     // Run the agent and persist its final response.
     const searchHits: SearchHit[] = [];
     const result = runResearchAgent(messages, {
       abortSignal: request.signal,
       onSearchResults: (hits) => searchHits.push(...hits),
+      historicalContext,
       onFinish: async (text) => {
         await saveMessage(
           conversationId,

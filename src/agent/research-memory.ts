@@ -3,6 +3,8 @@ import { z } from "zod";
 
 import { model } from "@/lib/ai";
 import {
+  findResearchSessions,
+  getObservations,
   saveObservations,
   saveResearchSession,
   type ResearchObservation,
@@ -20,6 +22,97 @@ const ExtractionSchema = z.object({
     validFrom: z.string().date().optional(),
   })).max(12),
 });
+
+const STOP_WORDS = new Set([
+  "a", "about", "after", "any", "are", "asked", "before", "changed", "changes",
+  "did", "does", "for", "from", "has", "have", "how", "i", "in", "is", "it",
+  "me", "my", "of", "on", "or", "our", "please", "since", "the", "them", "then",
+  "there", "these", "they", "this", "those", "to", "was", "we", "were", "what",
+  "when", "which", "who", "with", "you", "your", "still", "today", "now",
+]);
+
+const terms = (value: string) => new Set(
+  (value.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? [])
+    .filter((term) => term.length > 1 && !STOP_WORDS.has(term)),
+);
+
+function temporalMatch(query: string, timestamp: string) {
+  const observed = new Date(timestamp);
+  if (Number.isNaN(observed.getTime())) return false;
+  const queryLower = query.toLocaleLowerCase("en-US");
+  const observedDay = observed.getUTCDate();
+  const observedMonth = observed.getUTCMonth();
+  const observedYear = observed.getUTCFullYear();
+  const monthNames = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+
+  const iso = queryLower.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
+  if (iso) return observedYear === Number(iso[1]) && observedMonth === Number(iso[2]) - 1 && observedDay === Number(iso[3]);
+
+  const date = queryLower.match(/\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+(20\d{2}))?\b/);
+  if (date) {
+    const month = monthNames.indexOf(date[2]);
+    return observedDay === Number(date[1]) && observedMonth === month && (!date[3] || observedYear === Number(date[3]));
+  }
+
+  const weekdayIndex = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+    .findIndex((day) => new RegExp(`\\b${day}\\b`).test(queryLower));
+  if (weekdayIndex < 0) return false;
+  const now = new Date();
+  const latest = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const daysBack = (latest.getUTCDay() - weekdayIndex + 7) % 7 || 7;
+  latest.setUTCDate(latest.getUTCDate() - daysBack);
+  const lastWeek = new Date(latest);
+  lastWeek.setUTCDate(latest.getUTCDate() - 7);
+  const observedDate = Date.UTC(observedYear, observedMonth, observedDay);
+  return observedDate === latest.getTime() || observedDate === lastWeek.getTime();
+}
+
+export async function findRelevantResearch(conversationId: string, query: string) {
+  const sessions = await findResearchSessions({ conversationId, limit: 50 });
+  if (!sessions.length) return [];
+
+  const sessionIds = sessions.map((session) => String(session.id));
+  const observations = await getObservations({ sessionIds, limit: 200 });
+  const queryTerms = terms(query);
+  const scored = sessions.map((session) => {
+    const sessionObservations = observations.filter(
+      (observation) => String(observation.research_session_id) === String(session.id),
+    );
+    const entities = [...new Set(sessionObservations.map((observation) => String(observation.display_name)))];
+    const entityMatches = entities.filter((entity) =>
+      query.toLocaleLowerCase("en-US").includes(entity.toLocaleLowerCase("en-US")),
+    );
+    const topicTerms = terms(`${String(session.topic)} ${String(session.summary)}`);
+    const topicMatches = [...queryTerms].filter((term) => topicTerms.has(term));
+    const isDateMatch = temporalMatch(query, String(session.researched_at));
+    return { session, sessionObservations, entityMatches, topicMatches, isDateMatch, score: entityMatches.length * 3 + topicMatches.length + (isDateMatch ? 10 : 0) };
+  }).filter((item) => item.isDateMatch || item.entityMatches.length > 0 || item.topicMatches.length >= 2)
+    .sort((a, b) => b.score - a.score || String(b.session.researched_at).localeCompare(String(a.session.researched_at)))
+    .slice(0, 5);
+
+  return scored.map(({ session, sessionObservations }) => ({
+    session: {
+      topic: String(session.topic),
+      summary: String(session.summary),
+      researchedAt: String(session.researched_at),
+    },
+    observations: sessionObservations.map((observation) => ({
+      entity: String(observation.display_name),
+      entityType: String(observation.entity_type),
+      attribute: String(observation.attribute),
+      value: String(observation.value),
+      observedAt: String(observation.observed_at),
+      validFrom: observation.valid_from ? String(observation.valid_from) : undefined,
+      source: {
+        title: String(observation.title),
+        url: String(observation.url),
+        publisher: observation.publisher ? String(observation.publisher) : undefined,
+        publishedAt: observation.published_at ? String(observation.published_at) : undefined,
+        retrievedAt: String(observation.retrieved_at),
+      },
+    })),
+  }));
+}
 
 export async function recordResearch(input: {
   conversationId: string;
