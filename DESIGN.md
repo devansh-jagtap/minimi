@@ -26,6 +26,8 @@ The database is LibSQL. `ensureSchema()` creates tables and indexes with `CREATE
 | `entities` | Case-normalized entity identity shared across evidence rows; it has no owner column. |
 | `sources` | URL and first-seen title/publisher/publication metadata, plus latest retrieval time; it has no owner column. |
 | `observations` | Historical evidence value, entity/source/session links, observation/effective dates, and optional comparison dimensions. |
+| `documents` | Owner- and conversation-scoped file metadata, opaque storage key, processing status, retry count, and content/parser/embedding versions. |
+| `document_chunks` | Owner-scoped extracted chunks, page/heading metadata, hashes, and versioned embedding JSON. |
 
 `observations` preserves old rows: new research inserts a new observation rather than replacing a previous value. Comparison metadata is stored in nullable columns `plan_tier`, `currency`, `billing_interval`, `price_basis`, and `region`. Existing rows receive `NULL` for those fields, so they cannot support a confirmed price change under the comparison rules. Entity/source rows are shared and unowned; user isolation depends on first selecting owner-scoped research sessions and fetching observations only for those session IDs. The low-level observation/source helper functions do not independently require an owner parameter, so callers must retain that ordering constraint.
 
@@ -43,6 +45,12 @@ Research retrieval is global across conversations for one authenticated owner. I
 
 Price comparisons require matching entity and attribute plus non-empty matching plan tier, currency, billing interval, price basis, and region. The values must contain one parseable amount and use the same recognized currency. A difference under those conditions is classified as a confirmed change; equal normalized values are “no change found in available evidence.” Missing or mismatched dimensions, missing evidence, ambiguous amounts, or unsupported attributes return “insufficient evidence.” Non-price comparisons still rely on exact normalized entity/attribute matching and normalized value equality; arbitrary semantic equivalence is not inferred.
 
+## Document retrieval
+
+Uploads use authenticated upload intents and short-lived R2 presigned PUT URLs. The server generates opaque object keys, checks conversation ownership, verifies uploaded object size with HEAD, and changes the document to `queued`. Downloads use an owner-checked route that returns a short-lived signed URL. The bucket must remain private and be configured with the application origin in CORS.
+
+Run `bun run worker` to process queued files locally. The worker leases jobs, retries up to three times, marks processing failures visibly, extracts page-aware PDF text, DOCX headings/paragraphs/lists/tables, TXT blocks, or image text via Gemini vision, then creates structure-aware overlapping chunks and Gemini embeddings. Scanned PDF pages with little selectable text are rendered and passed through Gemini vision OCR. Retrieval is performed before the model call and limited to the authenticated user's current conversation. It ranks at most 1,000 candidate chunks using cosine similarity and lexical overlap, then supplies at most six bounded excerpts with filename/page/section citation labels. Document text is explicitly untrusted, and `webSearch` remains the sole model-callable tool.
+
 ## Time fields
 
 - `sources.published_at` is the publication date reported by Tavily when available.
@@ -58,7 +66,7 @@ Price comparisons require matching entity and attribute plus non-empty matching 
 
 ## Limitations
 
-- There is no dedicated background worker, embedding store, vector index, or document RAG pipeline in the current implementation.
+- Vector retrieval currently scans at most 1,000 conversation-scoped chunk rows and computes cosine similarity in application code. It does not depend on remote LibSQL vector indexes or add a vector database.
 - Memory and research matching are deterministic lexical/date retrieval, so paraphrases and ambiguous references can be missed.
 - Evidence validation checks only supplied search snippets and cannot independently verify all natural-language claims or source credibility.
 - Price comparisons are intentionally conservative; old observations or current sources missing any required comparison dimension return insufficient evidence.
@@ -66,3 +74,4 @@ Price comparisons require matching entity and attribute plus non-empty matching 
 - CRM, historical recall, and Postgres-hosting regression scenarios use static fixtures. They test application behavior, not current vendor pricing or live announcements.
 - Legacy conversation claiming cannot determine the rightful owner of shared pre-auth data. Deployments should avoid importing ambiguous records across accounts.
 - The database uses additive inline schema setup, not a managed migration history. The write queue is process-local.
+- R2 upload, download, OCR/vision, and live embedding smoke checks require local credentials and a configured private bucket; these have not been run without those credentials.
