@@ -25,6 +25,9 @@ export function runResearchAgent(
     maxRetries: 1,
     maxOutputTokens: 1500,
     temperature: 0.2,
+    onError: ({ error }) => {
+  console.error("[Minimi] Generation error:", error);
+},
 
     abortSignal: options?.abortSignal,
 
