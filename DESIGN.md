@@ -49,7 +49,7 @@ Price comparisons require matching entity and attribute plus non-empty matching 
 
 Uploads use authenticated upload intents and short-lived R2 presigned PUT URLs. The server generates opaque object keys, checks conversation ownership, verifies uploaded object size with HEAD, and changes the document to `queued`. Downloads use an owner-checked route that returns a short-lived signed URL. The bucket must remain private and be configured with the application origin in CORS.
 
-Run `bun run worker` to process queued files locally. The worker leases jobs, retries up to three times, marks processing failures visibly, extracts page-aware PDF text, DOCX headings/paragraphs/lists/tables, TXT blocks, or image text via Gemini vision, then creates structure-aware overlapping chunks and Gemini embeddings. Scanned PDF pages with little selectable text are rendered and passed through Gemini vision OCR. Retrieval is performed before the model call and limited to the authenticated user's current conversation. It ranks at most 1,000 candidate chunks using cosine similarity and lexical overlap, then supplies at most six bounded excerpts with filename/page/section citation labels. Document text is explicitly untrusted, and `webSearch` remains the sole model-callable tool.
+`bun run dev` starts the local document worker with Next.js; `bun run worker` can also run it separately. The worker leases jobs, retries up to three times, marks processing failures visibly, extracts page-aware PDF text, DOCX headings/paragraphs/lists/tables, TXT blocks, or image text via Gemini vision, then creates structure-aware overlapping chunks and Gemini embeddings. Scanned PDF pages with little selectable text are rendered and passed through Gemini vision OCR. Retrieval runs before the model call across completed documents owned by the authenticated user, regardless of which chat they came from; the current chat's files are ranked first. It ranks at most 1,000 candidate chunks using cosine similarity and lexical overlap, then supplies at most six bounded excerpts with filename/page/section labels and an indication when a file came from another chat. Removing an unsent file or deleting its source chat removes the stored object and indexed chunks, so it is no longer available in any chat. Document text is explicitly untrusted, and `webSearch` remains the sole model-callable tool.
 
 ## Time fields
 
@@ -62,11 +62,11 @@ Run `bun run worker` to process queued files locally. The worker leases jobs, re
 
 ## Local database artifact
 
-`data/minimi.db` is currently tracked by Git and should be removed from repository tracking while remaining intact on the developer's machine. It should not be committed or copied into fixtures because it contains mixed development records and may include private conversations. The inspected local database contained 12 conversations, 39 messages, 2 research sessions, and 10 observations. Counts and date ranges were used for inspection; message text was not printed. Six conversation IDs and three messages contained test-like markers, so this database cannot be classified as purely test data or empty. Keep the local file intact, and use synthetic fixtures in tests.
+Runtime database files under `data/` are excluded from Git; only `.gitkeep` is tracked so the default `file:./data/minimi.db` path has a parent directory in a fresh checkout. The local database contains mixed development and user records and may include private conversations, so keep it on the developer's machine and use synthetic fixtures in tests. Existing database contents are preserved by the additive schema migration path.
 
 ## Limitations
 
-- Vector retrieval currently scans at most 1,000 conversation-scoped chunk rows and computes cosine similarity in application code. It does not depend on remote LibSQL vector indexes or add a vector database.
+- Vector retrieval currently scans at most 1,000 owner-scoped chunk rows and computes cosine similarity in application code. It does not depend on remote LibSQL vector indexes or add a vector database.
 - Memory and research matching are deterministic lexical/date retrieval, so paraphrases and ambiguous references can be missed.
 - Evidence validation checks only supplied search snippets and cannot independently verify all natural-language claims or source credibility.
 - Price comparisons are intentionally conservative; old observations or current sources missing any required comparison dimension return insufficient evidence.

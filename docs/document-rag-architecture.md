@@ -6,7 +6,7 @@ Keep the existing Next.js App Router, Clerk, LibSQL, Gemini, Tavily, and the one
 
 Original files live in a private Cloudflare R2 bucket. The browser receives only short-lived presigned `PUT` or `GET` URLs for opaque object keys. The server creates keys and metadata; clients never choose storage keys. Every create, complete, list, retrieve, download, and delete operation checks Clerk ownership. A conversation association is checked against its owner before a file can be attached.
 
-LibSQL remains the metadata and job database. Add additive tables for files, processing attempts/status, document chunks, and embeddings; each row carries an owner ID or is reached only through an owner-filtered file/session join. Retrieval filters by both owner and current conversation before chunk text enters model context. Initial retrieval is conversation-attached only; a user-wide document library is out of scope until explicitly designed.
+LibSQL remains the metadata and job database. Add additive tables for files, processing attempts/status, document chunks, and embeddings; each row carries an owner ID or is reached only through an owner-filtered file/session join. Retrieval filters by authenticated owner before any chunk text enters model context and can find completed files across that owner's conversations. The current conversation's files receive ranking priority. Other users' file metadata and chunks must never enter retrieval results.
 
 ## Upload and processing lifecycle
 
@@ -24,7 +24,7 @@ Statuses are `uploaded`, `queued`, `processing`, `completed`, and `failed`. A lo
 
 Use the existing Gemini embedding provider and LibSQL only. Local in-memory probing confirms the installed LibSQL client can run vector functions/indexes and SQLite FTS5, but this does not prove the configured remote database has those capabilities. First use capability probing against the actual configured database. Until remote vector support is confirmed, keep retrieval portable: store versioned vectors and compute cosine similarity over owner-scoped chunks for the local demonstration, alongside FTS5 only when that capability probe succeeds. Do not add a vector database without evidence that the configured LibSQL deployment cannot support the required workload.
 
-Retrieve a bounded candidate set, apply owner/conversation filters in SQL before returning text, combine semantic and keyword candidates when available, deduplicate, apply a relevance threshold, and cap prompt context. Present retrieved excerpts as untrusted quoted evidence. Instruct Gemini to ignore embedded document instructions, cite filename plus page/heading, and say when the excerpts do not support an answer.
+Retrieve a bounded candidate set, apply owner filters in SQL before returning text, combine semantic and keyword candidates when available, deduplicate, apply a relevance threshold, and cap prompt context. Present retrieved excerpts as untrusted quoted evidence. Instruct Gemini to ignore embedded document instructions, cite filename plus page/heading, identify when a file came from another chat, and say when the excerpts do not support an answer. Removing a pending file or deleting its source conversation also removes its object and chunks, making that file unavailable across chats.
 
 ## Deterministic acceptance fixtures
 
