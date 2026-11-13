@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { claimLegacyConversations } from "@/lib/db";
 
-const ClaimSchema = z.object({ conversationIds: z.array(z.string().min(1).max(100)).max(100) });
+const ClaimSchema = z.object({ conversations: z.array(z.object({ id: z.string().min(1).max(100), proof: z.string().regex(/^[a-f0-9]{64}$/i), messageCount: z.number().int().min(1).max(40) })).max(100) });
 
 export async function POST(request: Request) {
   if (!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !process.env.CLERK_SECRET_KEY) {
@@ -15,7 +15,7 @@ export async function POST(request: Request) {
     if (!userId) return Response.json({ error: "Sign in to import your saved research." }, { status: 401 });
     const parsed = ClaimSchema.safeParse(await request.json());
     if (!parsed.success) return Response.json({ error: "Invalid conversation import request." }, { status: 400 });
-    const claimed = await claimLegacyConversations(userId, parsed.data.conversationIds);
+    const claimed = await claimLegacyConversations(userId, parsed.data.conversations);
     return Response.json({ claimedCount: claimed.length });
   } catch {
     return Response.json({ error: "Unable to import saved research." }, { status: 500 });

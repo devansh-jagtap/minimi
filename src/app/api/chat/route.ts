@@ -5,7 +5,7 @@ import { auth } from "@clerk/nextjs/server";
 
 import { runResearchAgent } from "@/agent/orchestrator";
 import { findRelevantResearch, recordResearch } from "@/agent/research-memory";
-import { dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate, selectRecallTurns } from "@/agent/history-recall";
+import { dateWindowUtc, formatCalendarDate, historyRecallTopic, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate, selectRecallTurns } from "@/agent/history-recall";
 import type { SearchHit } from "@/tools/web-search";
 import {
   ensureSchema,
@@ -48,10 +48,6 @@ export async function DELETE(request: Request) {
 
 function event(data: Record<string, unknown>) {
   return `${JSON.stringify(data)}\n`;
-}
-
-function formatRequestedDate(date: { year: number; month: number; day: number }, timeZone: string) {
-  return new Intl.DateTimeFormat("en-US", { dateStyle: "long", timeZone }).format(new Date(Date.UTC(date.year, date.month, date.day, 12)));
 }
 
 function cleanRecalledAnswer(answer: string) {
@@ -97,8 +93,8 @@ export async function POST(request: Request) {
       })), historyRecallTopic(body.message));
       const recallTranscript = turns.map((turn) => `You asked: “${turn.question}”${turn.answer ? `\n\nMinimi answered: ${cleanRecalledAnswer(turn.answer)}` : "\n\nI found the question, but no saved answer."}`);
       const recallAnswer = recallTranscript.length
-        ? `${requestedDate ? `I found this saved discussion from ${formatRequestedDate(requestedDate, timeZone)}:` : "I found this saved discussion:"}\n\n${recallTranscript.join("\n\n---\n\n")}`
-        : `I couldn't find a saved discussion${requestedDate ? ` dated ${formatRequestedDate(requestedDate, timeZone)}` : " matching that topic"} in this local Minimi database.`;
+        ? `${requestedDate ? `I found this saved discussion from ${formatCalendarDate(requestedDate)}:` : "I found this saved discussion:"}\n\n${recallTranscript.join("\n\n---\n\n")}`
+        : `I couldn't find a saved discussion${requestedDate ? ` dated ${formatCalendarDate(requestedDate)}` : " matching that topic"} in this local Minimi database.`;
 
       await saveMessage(conversationId, "user", body.message, userId);
       await saveMessage(conversationId, "assistant", recallAnswer, userId);

@@ -109,6 +109,11 @@ export function sameDate(left: CalendarDate | null, right: CalendarDate) {
   return !!left && left.year === right.year && left.month === right.month && left.day === right.day;
 }
 
+export function formatCalendarDate(date: CalendarDate) {
+  return new Intl.DateTimeFormat("en-US", { dateStyle: "long", timeZone: "UTC" })
+    .format(new Date(Date.UTC(date.year, date.month, date.day, 12)));
+}
+
 type RecallRow = { id: number | string; conversation_id: string; role: string; content: string; created_at: string };
 
 function isFailedRecallAnswer(answer: string) {
