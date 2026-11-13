@@ -20,6 +20,7 @@ type SavedConversation = {
   updatedAt: string;
   messages: Message[];
 };
+type UploadedDocument = { id: string; filename: string; status: string; error_message?: string };
 
 const CONVERSATIONS_KEY = "minimi-conversations-v1";
 const ACTIVE_CONVERSATION_KEY = "minimi-active-conversation-v1";
@@ -194,6 +195,9 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
   const [error, setError] = useState("");
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+  const [uploadStatus, setUploadStatus] = useState("");
+  const [uploadedDocuments, setUploadedDocuments] = useState<UploadedDocument[]>([]);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const [activityNow, setActivityNow] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -202,6 +206,24 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
 
   useEffect(() => { conversationsRef.current = conversations; }, [conversations]);
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
+
+  useEffect(() => {
+    if (!activeId || !isHydrated) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const response = await fetch(`/api/documents?conversationId=${encodeURIComponent(activeId)}`, { cache: "no-store" });
+        if (response.ok) {
+          const data = await response.json() as { documents?: UploadedDocument[] };
+          if (!stopped) setUploadedDocuments(data.documents ?? []);
+        }
+      } catch { /* document status is supplementary to chat */ }
+      if (!stopped) timer = setTimeout(() => void refresh(), 5000);
+    };
+    void refresh();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [activeId, isHydrated]);
 
   useEffect(() => {
     let cancelled = false;
@@ -466,11 +488,43 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
     }
   }, [input, isStreaming, webSearchEnabled]);
 
+  const uploadFiles = useCallback(async (files: FileList | null) => {
+    if (!files?.length || !activeIdRef.current) return;
+    const supported = new Set(["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/plain", "image/png", "image/jpeg", "image/webp"]);
+    for (const file of Array.from(files)) {
+      if (!supported.has(file.type)) { setUploadStatus(`${file.name}: unsupported file type`); continue; }
+      try {
+        setUploadStatus(`Uploading ${file.name}…`);
+        const intentResponse = await fetch("/api/documents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId: activeIdRef.current, filename: file.name, mimeType: file.type, sizeBytes: file.size }) });
+        const intent = await intentResponse.json() as { id?: string; uploadUrl?: string; error?: string };
+        if (!intentResponse.ok || !intent.id || !intent.uploadUrl) throw new Error(intent.error ?? "Upload could not be started.");
+        const uploadResponse = await fetch(intent.uploadUrl, { method: "PUT", headers: { "Content-Type": file.type }, body: file });
+        if (!uploadResponse.ok) throw new Error("R2 upload failed. Check bucket CORS and try again.");
+        const complete = await fetch(`/api/documents/${intent.id}/complete`, { method: "POST" });
+        if (!complete.ok) throw new Error("Upload verification failed.");
+        setUploadStatus(`${file.name} uploaded. Processing will start when the document worker is running.`);
+      } catch (caught) {
+        setUploadStatus(caught instanceof Error ? caught.message : "Document upload failed.");
+      }
+    }
+    if (uploadInputRef.current) uploadInputRef.current.value = "";
+  }, []);
+
+  const retryDocument = useCallback(async (id: string) => {
+    const response = await fetch(`/api/documents/${id}/retry`, { method: "POST" });
+    if (response.ok) setUploadStatus("Document queued again.");
+    else setUploadStatus("Could not retry this document.");
+  }, []);
+
   const currentTitle = messages.length ? firstQuestion(messages) : "New research";
   const composer = (
     <div className={`composer-area${messages.length === 0 ? " composer-area-centered" : ""}`}>
       {error && <div className="composer-error" role="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
       <form className="composer" onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}>
+        <input ref={uploadInputRef} type="file" accept=".pdf,.docx,.txt,.png,.jpg,.jpeg,.webp" multiple hidden onChange={(event) => void uploadFiles(event.target.files)} />
+        <button type="button" className="composer-attach" onClick={() => uploadInputRef.current?.click()} disabled={!isHydrated || !activeId} aria-label="Attach documents">Attach files</button>
+        {uploadStatus && <span className="composer-hint" role="status">{uploadStatus}</span>}
+        {uploadedDocuments.length > 0 && <div className="document-list" aria-label="Conversation documents">{uploadedDocuments.map((document) => <span key={document.id} className="document-chip" title={document.error_message ?? document.status}>{document.filename} · {document.status}{document.status === "failed" && <button type="button" onClick={() => void retryDocument(document.id)}>Retry</button>}</span>)}</div>}
         <label className="sr-only" htmlFor="research-question">Ask Minimi a research question</label>
         <textarea id="research-question" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Ask a question or revisit something you researched…" rows={1} disabled={!isHydrated} />
         <div className="composer-footer">
