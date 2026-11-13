@@ -41,6 +41,45 @@ describe("structured research persistence", () => {
     expect(sessions.map((row) => row.id)).toContain(session.id);
   });
 
+  it("migrates a legacy schema additively and preserves saved data", async () => {
+    const legacyUrl = pathToFileURL(join(temporaryDirectory, "legacy.db")).href;
+    const legacyClient = createClient({ url: legacyUrl });
+    await legacyClient.batch([
+      "CREATE TABLE conversations (id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+      "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+      "CREATE TABLE research_sessions (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, topic TEXT NOT NULL, summary TEXT NOT NULL, researched_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+      "CREATE TABLE entities (id TEXT PRIMARY KEY, normalized_name TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, entity_type TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+      "CREATE TABLE sources (id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, title TEXT NOT NULL, publisher TEXT, published_at TEXT, retrieved_at TEXT NOT NULL)",
+      "CREATE TABLE observations (id TEXT PRIMARY KEY, research_session_id TEXT NOT NULL, entity_id TEXT NOT NULL, source_id TEXT NOT NULL, attribute TEXT NOT NULL, value TEXT NOT NULL, observed_at TEXT NOT NULL, valid_from TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+      "INSERT INTO conversations (id) VALUES ('legacy-preserved')",
+      "INSERT INTO messages (conversation_id, role, content) VALUES ('legacy-preserved', 'user', 'legacy user data stays private')",
+      "INSERT INTO research_sessions (id, conversation_id, topic, summary, researched_at) VALUES ('legacy-session', 'legacy-preserved', 'legacy topic', 'legacy summary', '2026-11-03T10:00:00.000Z')",
+      "INSERT INTO entities (id, normalized_name, display_name, entity_type) VALUES ('legacy-entity', 'legacy co', 'Legacy Co', 'company')",
+      "INSERT INTO sources (id, url, title, retrieved_at) VALUES ('legacy-source', 'https://legacy.example', 'Legacy source', '2026-11-03T10:00:00.000Z')",
+      "INSERT INTO observations (id, research_session_id, entity_id, source_id, attribute, value, observed_at) VALUES ('legacy-observation', 'legacy-session', 'legacy-entity', 'legacy-source', 'price', '$19', '2026-11-03T10:00:00.000Z')",
+    ], "write");
+    await legacyClient.close();
+
+    vi.stubEnv("DATABASE_URL", legacyUrl);
+    vi.resetModules();
+    const legacyDb = await import("../src/lib/db");
+    await legacyDb.ensureSchema();
+    const messages = await legacyDb.db.execute("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = 'legacy-preserved'");
+    const sessions = await legacyDb.db.execute("SELECT COUNT(*) AS count FROM research_sessions WHERE id = 'legacy-session'");
+    const migrated = await legacyDb.db.execute("SELECT user_id FROM conversations WHERE id = 'legacy-preserved'");
+    const addedColumns = await legacyDb.db.execute("PRAGMA table_info(observations)");
+    expect(Number(messages.rows[0]?.count)).toBe(1);
+    expect(Number(sessions.rows[0]?.count)).toBe(1);
+    expect(String(migrated.rows[0]?.user_id)).toBe(legacyDb.LOCAL_USER_ID);
+    expect(addedColumns.rows.map((row) => String(row.name))).toContain("plan_tier");
+    await legacyDb.db.close();
+
+    vi.stubEnv("DATABASE_URL", databaseUrl);
+    vi.resetModules();
+    memory = await import("../src/lib/db");
+    await memory.ensureSchema();
+  });
+
   it("deduplicates entities and sources while preserving separate observations", async () => {
     const first = await memory.saveResearchSession({
       conversationId: "dedupe",
@@ -122,8 +161,10 @@ describe("structured research persistence", () => {
     const result = await findRelevantResearch("crm-fixture", "Has HubSpot, Salesforce, Pipedrive, Zoho CRM, or Freshsales changed pricing for our 20-person team?");
     const historical = result[0]?.observations ?? [];
     expect(historical).toHaveLength(5);
-    expect(classifyObservationComparison({ entity: "HubSpot", attribute: "Entry plan price per user per month", value: "$20/user/month", sourceUrl: "https://fixture.example/HubSpot" }, {
-      entity: "HubSpot", attribute: "Entry plan price per user per month", value: "$25/user/month", sourceUrl: "https://fixture.example/current" },
+    expect(classifyObservationComparison({ entity: "HubSpot", attribute: "Entry plan price per user per month", value: "$20/user/month", sourceUrl: "https://fixture.example/HubSpot",
+      comparison: { planTier: "Starter", currency: "USD", billingInterval: "monthly", priceBasis: "per user", region: "US" } }, {
+      entity: "HubSpot", attribute: "Entry plan price per user per month", value: "$25/user/month", sourceUrl: "https://fixture.example/current",
+      comparison: { planTier: "Starter", currency: "USD", billingInterval: "monthly", priceBasis: "per user", region: "US" } },
     )).toBe("confirmed change");
   });
 
@@ -161,7 +202,7 @@ describe("structured research persistence", () => {
     const { dateWindowUtc, parseRecallDate, localDateParts, sameDate } = await import("../src/agent/history-recall");
     const requestedDate = parseRecallDate("what we discussed about Meta on 13th nov", "Asia/Kolkata", new Date("2026-11-13T00:00:00Z"))!;
     const matchingDay = sameOwner.filter((row) => sameDate(localDateParts(String(row.created_at), "Asia/Kolkata"), requestedDate));
-    const dayRows = await searchUserMessages({ userId: LOCAL_USER_ID, query: "MetaCrossTest", ...dateWindowUtc(requestedDate) });
+    const dayRows = await searchUserMessages({ userId: LOCAL_USER_ID, query: "MetaCrossTest", ...dateWindowUtc(requestedDate, "Asia/Kolkata") });
     expect(matchingDay.length).toBeGreaterThan(0);
     expect(dayRows.map((row) => row.conversation_id)).toContain("global-memory-a");
   });
@@ -225,16 +266,22 @@ describe("structured research persistence", () => {
     await saveMessage("delete-chat-a", "assistant", "DeleteMe answer", LOCAL_USER_ID);
     const session = await memory.saveResearchSession({ conversationId: "delete-chat-a", topic: "DeleteMe research", summary: "DeleteMe summary", researchedAt: "2026-11-10T10:00:00.000Z" });
     await memory.saveObservations(session.id, [{ entity: { name: "DeleteMe Co", type: "company" }, source: { url: "https://delete-me.example", title: "DeleteMe source" }, attribute: "status", value: "old" }], session.researchedAt);
+    const sharedSession = await memory.saveResearchSession({ conversationId: "delete-chat-b", topic: "Keep shared evidence", summary: "Evidence from another conversation", researchedAt: "2026-11-11T10:00:00.000Z" });
+    await memory.saveObservations(sharedSession.id, [{ entity: { name: "DeleteMe Co", type: "company" }, source: { url: "https://delete-me.example", title: "DeleteMe source" }, attribute: "status", value: "new" }], sharedSession.researchedAt);
     await saveMemoryItem({ userId: LOCAL_USER_ID, conversationId: "delete-chat-a", memoryType: "research", content: "DeleteMe memory", summary: "DeleteMe summary" });
     await memory.db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: ["delete-other-user"] });
-    await saveMessage("delete-chat-b", "user", "DeleteMe other-owner conversation", "delete-other-user");
+    await saveMessage("delete-chat-other", "user", "DeleteMe other-owner conversation", "delete-other-user");
 
     expect(await deleteConversation("delete-other-user", "delete-chat-a")).toBe(false);
     expect(await deleteConversation(LOCAL_USER_ID, "delete-chat-a")).toBe(true);
     expect((await memory.getRecentMessages(LOCAL_USER_ID, "delete-chat-a"))).toEqual([]);
     expect((await memory.findResearchSessions({ conversationId: "delete-chat-a" }))).toEqual([]);
+    const retainedSession = await memory.findResearchSessions({ conversationId: "delete-chat-b" });
+    const retainedObservations = await memory.getObservations({ sessionIds: retainedSession.map((row) => String(row.id)) });
+    expect(retainedObservations.map((row) => row.value)).toContain("new");
+    expect((await memory.getSources(retainedObservations.map((row) => String(row.source_id)))).map((row) => row.url)).toContain("https://delete-me.example");
     expect((await memory.db.execute({ sql: "SELECT id FROM memory_items WHERE source_conversation_id = ?", args: ["delete-chat-a"] })).rows).toEqual([]);
-    expect((await memory.getRecentMessages("delete-other-user", "delete-chat-b")).map((row) => row.content)).toContain("DeleteMe other-owner conversation");
+    expect((await memory.getRecentMessages("delete-other-user", "delete-chat-other")).map((row) => row.content)).toContain("DeleteMe other-owner conversation");
   });
 
   it("rejects observations with missing foreign-key parents", async () => {
@@ -265,19 +312,45 @@ describe("structured research persistence", () => {
     expect(await memory.findEntities(["Concurrent Co"])).toHaveLength(1);
     expect(await memory.getObservations({ sessionIds: sessions.map((session) => session.id) })).toHaveLength(8);
   });
+
+  it("does not allow another account to read or append to a conversation", async () => {
+    const { LOCAL_USER_ID, saveMessage, getRecentMessages } = await import("../src/lib/db");
+    await saveMessage("private-conversation", "user", "owner-only fixture", LOCAL_USER_ID);
+    expect(await getRecentMessages("another-user", "private-conversation")).toEqual([]);
+    await expect(saveMessage("private-conversation", "user", "unauthorized append", "another-user")).rejects.toThrow(/owner mismatch/i);
+    expect((await getRecentMessages(LOCAL_USER_ID, "private-conversation")).map((row) => row.content)).toEqual(["owner-only fixture"]);
+  });
+
+  it("allows only one concurrent account to claim a legacy conversation", async () => {
+    const { claimLegacyConversations, LOCAL_USER_ID } = await import("../src/lib/db");
+    await memory.db.execute({ sql: "INSERT OR IGNORE INTO conversations (id, user_id) VALUES (?, ?)", args: ["claim-race", "local-single-user"] });
+    const [first, second] = await Promise.all([
+      claimLegacyConversations("claim-user-a", ["claim-race"]),
+      claimLegacyConversations("claim-user-b", ["claim-race"]),
+    ]);
+    const owner = await memory.db.execute({ sql: "SELECT user_id FROM conversations WHERE id = ?", args: ["claim-race"] });
+    expect([first.length, second.length].sort()).toEqual([0, 1]);
+    expect(["claim-user-a", "claim-user-b"]).toContain(String(owner.rows[0]?.user_id));
+    expect(String(owner.rows[0]?.user_id)).not.toBe(LOCAL_USER_ID);
+  });
 });
 
 describe("evidence validation and comparison outcomes", () => {
-  it("parses ordinal day-first dates and handles UTC messages in the user's local day", async () => {
+  it("parses local-day dates and weekday references across UTC boundaries", async () => {
     const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion, selectRecallTurns } = await import("../src/agent/history-recall");
     const date = parseRecallDate("what we discussed about Meta on 13th nov", "Asia/Kolkata", new Date("2026-11-13T00:00:00Z"));
 
     expect(date).toEqual({ year: 2026, month: 10, day: 13 });
     expect(sameDate(localDateParts("2026-11-12 21:17:03", "Asia/Kolkata"), date!)).toBe(true);
-    expect(dateWindowUtc(date!)).toEqual({ startUtc: "2026-11-12 00:00:00", endUtc: "2026-11-15 00:00:00" });
+    expect(dateWindowUtc(date!, "Asia/Kolkata")).toEqual({ startUtc: "2026-11-12 18:30:00", endUtc: "2026-11-13 18:30:00" });
     expect(isHistoryRecallQuestion("what we discussed about the meta on 13th nov")).toBe(true);
     expect(historyRecallTopic("What did I ask you on 3 November?")).toBe("");
     expect(historyRecallTopic("what we discussed about the meta on 13th nov")).toBe("meta");
+    expect(historyRecallTopic("what did I ask you about last Monday?")).toBe("");
+    expect(parseRecallDate("what did I ask you about last Monday?", "Asia/Kolkata", new Date("2026-11-13T00:30:00Z"))).toEqual({ year: 2026, month: 10, day: 9 });
+    const { temporalMatch } = await import("../src/agent/research-memory");
+    expect(temporalMatch("last Monday", "2026-11-09T17:00:00Z", "Asia/Kolkata", new Date("2026-11-13T00:30:00Z"))).toBe(true);
+    expect(temporalMatch("last Monday", "2026-11-09T18:30:00Z", "Asia/Kolkata", new Date("2026-11-13T00:30:00Z"))).toBe(false);
     const turns = selectRecallTurns([
       { id: 1, conversation_id: "old-meta", role: "user", content: "Why is Meta not in the frontier AI race?", created_at: "2026-11-12 20:56:59" },
       { id: 2, conversation_id: "old-meta", role: "assistant", content: "We discussed its open-weight strategy, business incentives, and benchmark performance.", created_at: "2026-11-12 20:57:08" },
@@ -309,13 +382,39 @@ describe("evidence validation and comparison outcomes", () => {
       sourceUrl: "https://other.example/pricing",
       evidenceQuote: "Example plan costs $200 per user per month.",
     }] }, [hit])).toEqual([]);
+    expect(filterSupportedObservations({ observations: [{
+      entity: "Example", entityType: "company", attribute: "Pro price", value: "$200 per user per month",
+      sourceUrl: hit.url, evidenceQuote: "Example plan costs $20 per user per month.",
+    }] }, [hit])).toEqual([]);
+    const datedHit = { ...hit, content: "Example plan costs $20 per user per month effective November 13, 2026." };
+    expect(filterSupportedObservations({ observations: [{
+      entity: "Example", entityType: "company", attribute: "Pro price", value: "$20 per user per month",
+      sourceUrl: hit.url, evidenceQuote: "Example plan costs $20 per user per month effective November 13, 2026.", validFrom: "2026-11-12",
+    }] }, [datedHit])).toEqual([]);
+    expect(filterSupportedObservations({ observations: [{
+      entity: "Example", entityType: "company", attribute: "Pro price", value: "€20 per user per month",
+      sourceUrl: hit.url, evidenceQuote: "Example plan costs $20 per user per month.",
+    }] }, [hit])).toEqual([]);
+    expect(filterSupportedObservations({ observations: [{
+      entity: "Example", entityType: "company", attribute: "Pro price", value: "$20 per user per month",
+      sourceUrl: hit.url, evidenceQuote: "Example plan costs $20 per user per month effective November 13, 2026.", validFrom: "2026-11-13",
+    }] }, [datedHit])).toHaveLength(1);
   });
 
   it("distinguishes comparable changes from missing evidence", async () => {
     const { classifyObservationComparison } = await import("../src/agent/research-memory");
-    const historical = { entity: "Neon", attribute: "Pro price", value: "$19", sourceUrl: "https://old.example/pricing" };
-    expect(classifyObservationComparison(historical, { ...historical, value: "$25", sourceUrl: "https://new.example/pricing" })).toBe("confirmed change");
-    expect(classifyObservationComparison(historical, { ...historical, value: " $19  ", sourceUrl: "https://new.example/pricing" })).toBe("no change found in available evidence");
+    const comparison = { planTier: "Pro", currency: "USD", billingInterval: "monthly", priceBasis: "per account", region: "US" };
+    const historical = { entity: "Neon", attribute: "Pro price", value: "$19/month", sourceUrl: "https://old.example/pricing", comparison };
+    const current = { ...historical, value: "$25/month", sourceUrl: "https://new.example/pricing" };
+    expect(classifyObservationComparison(historical, current)).toBe("confirmed change");
+    expect(classifyObservationComparison(historical, { ...historical, value: " $19/month  ", sourceUrl: "https://new.example/pricing" })).toBe("no change found in available evidence");
+    expect(classifyObservationComparison({ ...historical, value: "$19/user/month", comparison: { ...comparison, priceBasis: "per user" } }, { ...historical, value: "$25/user/month", sourceUrl: "https://new.example/pricing", comparison: { ...comparison, priceBasis: "per user" } })).toBe("confirmed change");
+    expect(classifyObservationComparison({ ...historical, value: "$19/user/month", comparison: undefined }, { ...historical, value: "$25/user/month", sourceUrl: "https://new.example/pricing", comparison: undefined })).toBe("insufficient evidence");
+    expect(classifyObservationComparison({ ...historical, value: "$19/month", comparison: undefined }, { ...historical, value: "$25/month", sourceUrl: "https://new.example/pricing", comparison: undefined })).toBe("insufficient evidence");
+    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, billingInterval: "annual" } })).toBe("insufficient evidence");
+    expect(classifyObservationComparison(historical, { ...current, value: "€25/month", comparison: { ...comparison, currency: "EUR" } })).toBe("insufficient evidence");
+    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, planTier: "Enterprise" } })).toBe("insufficient evidence");
+    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, region: undefined } })).toBe("insufficient evidence");
     expect(classifyObservationComparison(undefined, { ...historical, sourceUrl: "https://new.example/pricing" })).toBe("insufficient evidence");
     expect(classifyObservationComparison(historical, undefined)).toBe("insufficient evidence");
     expect(classifyObservationComparison(historical, { ...historical, attribute: "Enterprise price", sourceUrl: "https://new.example/pricing" })).toBe("insufficient evidence");
