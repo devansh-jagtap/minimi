@@ -117,8 +117,8 @@ function temporalMatch(query: string, timestamp: string) {
   return observedDate === latest.getTime() || observedDate === lastWeek.getTime();
 }
 
-export async function findRelevantResearch(conversationId: string, query: string, temporalQuery = query) {
-  const sessions = await findResearchSessions({ conversationId, limit: 50 });
+export async function findRelevantResearch(ownerId: string, query: string, temporalQuery = query, globalUserScope = false) {
+  const sessions = await findResearchSessions(globalUserScope ? { userId: ownerId, limit: 50 } : { conversationId: ownerId, limit: 50 });
   if (!sessions.length) return [];
 
   const sessionIds = sessions.map((session) => String(session.id));

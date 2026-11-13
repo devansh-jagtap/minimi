@@ -35,6 +35,10 @@ export type ResearchObservation = {
   validFrom?: string;
 };
 
+// This app currently has no authentication. This stable server-side owner key
+// is suitable only for a single-user local installation.
+export const LOCAL_USER_ID = process.env.MINIMI_LOCAL_USER_ID?.trim() || "local-single-user";
+
 export type StoredObservation = ResearchObservation & {
   id: string;
   researchSessionId: string;
@@ -67,6 +71,24 @@ export function ensureSchema() {
         [
           `CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL DEFAULT 'local-single-user',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          )`,
+          `CREATE TABLE IF NOT EXISTS memory_items (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            memory_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            source_conversation_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (memory_type IN ('preferences', 'facts', 'projects', 'decisions', 'research', 'technical_context', 'important_discussions')),
+            FOREIGN KEY (user_id) REFERENCES local_users(id),
+            FOREIGN KEY (source_conversation_id) REFERENCES conversations(id)
+          )`,
+          `CREATE TABLE IF NOT EXISTS local_users (
+            id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
           )`,
           `CREATE TABLE IF NOT EXISTS messages (
@@ -80,9 +102,16 @@ export function ensureSchema() {
           )`,
           `CREATE INDEX IF NOT EXISTS idx_messages_conversation
             ON messages(conversation_id, created_at)`,
+          `CREATE INDEX IF NOT EXISTS idx_messages_date
+            ON messages(created_at, conversation_id)`,
+          `CREATE INDEX IF NOT EXISTS idx_memory_items_user
+            ON memory_items(user_id, memory_type, updated_at DESC)`,
+          `CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_dedupe
+            ON memory_items(user_id, source_conversation_id, LOWER(summary))`,
           `CREATE TABLE IF NOT EXISTS research_sessions (
             id TEXT PRIMARY KEY,
             conversation_id TEXT NOT NULL,
+            user_id TEXT NOT NULL DEFAULT 'local-single-user',
             topic TEXT NOT NULL,
             summary TEXT NOT NULL,
             researched_at TEXT NOT NULL,
@@ -131,6 +160,21 @@ export function ensureSchema() {
         ],
         "write"
       );
+      // Safe additive migration for databases created before owner scoping.
+      for (const [table, column, definition] of [
+        ["conversations", "user_id", "TEXT NOT NULL DEFAULT 'local-single-user'"],
+        ["research_sessions", "user_id", "TEXT NOT NULL DEFAULT 'local-single-user'"],
+      ]) {
+        const columns = await db.execute(`PRAGMA table_info(${table})`);
+        if (!columns.rows.some((row) => String(row.name) === column)) {
+          await db.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+        }
+      }
+      await db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: [LOCAL_USER_ID] });
+      await db.execute({ sql: "UPDATE conversations SET user_id = ? WHERE user_id = 'local-single-user'", args: [LOCAL_USER_ID] });
+      await db.execute({ sql: "UPDATE research_sessions SET user_id = ? WHERE user_id = 'local-single-user'", args: [LOCAL_USER_ID] });
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, created_at DESC)");
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_research_sessions_user ON research_sessions(user_id, researched_at DESC)");
     })().catch((error) => {
       schemaPromise = undefined;
       throw error;
@@ -143,14 +187,17 @@ export function ensureSchema() {
 export async function saveMessage(
   conversationId: string,
   role: "user" | "assistant",
-  content: string
+  content: string,
+  userId = LOCAL_USER_ID,
 ) {
   await ensureSchema();
   await withWriteLock(async () => {
     await db.execute({
-      sql: `INSERT OR IGNORE INTO conversations (id) VALUES (?)`,
-      args: [conversationId],
+      sql: `INSERT OR IGNORE INTO conversations (id, user_id) VALUES (?, ?)`,
+      args: [conversationId, userId],
     });
+    const owner = await db.execute({ sql: "SELECT user_id FROM conversations WHERE id = ?", args: [conversationId] });
+    if (String(owner.rows[0]?.user_id) !== userId) throw new Error("Conversation owner mismatch");
 
     await db.execute({
       sql: `INSERT INTO messages
@@ -159,6 +206,57 @@ export async function saveMessage(
       args: [conversationId, role, content],
     });
   });
+}
+
+export async function searchUserMessages(input: { userId: string; query: string; startUtc?: string; endUtc?: string; limit?: number }) {
+  await ensureSchema();
+  const terms = [...new Set((input.query.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? []).filter((term) => term.length > 2 && !["what", "about", "with", "from", "that", "this", "were", "discussed", "talked", "asked"].includes(term)))].slice(0, 6);
+  const conditions = terms.map(() => "LOWER(m.content) LIKE ?").join(" OR ");
+  if (!conditions) return [];
+  const dateCondition = input.startUtc && input.endUtc ? "AND m.created_at >= ? AND m.created_at < ?" : "";
+  const result = await db.execute({
+    sql: `SELECT m.conversation_id, m.role, m.content, m.created_at
+          FROM messages m JOIN conversations c ON c.id = m.conversation_id
+          WHERE c.user_id = ? ${dateCondition}
+          ${conditions ? `AND (${conditions})` : ""}
+          ORDER BY m.id DESC LIMIT ?`,
+    args: [input.userId, ...(dateCondition ? [input.startUtc!, input.endUtc!] : []), ...terms.map((term) => `%${term}%`), Math.min(input.limit ?? 40, 100)],
+  });
+  return result.rows.reverse();
+}
+
+export async function saveMemoryItem(input: { userId: string; conversationId: string; memoryType: string; content: string; summary: string }) {
+  await ensureSchema();
+  await db.execute({ sql: "INSERT OR IGNORE INTO conversations (id, user_id) VALUES (?, ?)", args: [input.conversationId, input.userId] });
+  const conversationOwner = await db.execute({ sql: "SELECT user_id FROM conversations WHERE id = ?", args: [input.conversationId] });
+  if (String(conversationOwner.rows[0]?.user_id) !== input.userId) throw new Error("Memory source conversation owner mismatch");
+  return withWriteLock(async () => {
+    const normalized = input.summary.trim().toLocaleLowerCase("en-US");
+    const id = randomUUID();
+    await db.execute({
+      sql: `INSERT OR IGNORE INTO memory_items (id, user_id, memory_type, content, summary, source_conversation_id) VALUES (?, ?, ?, ?, ?, ?)`,
+      args: [id, input.userId, input.memoryType, input.content, input.summary, input.conversationId],
+    });
+    const existing = await db.execute({
+      sql: "SELECT id FROM memory_items WHERE user_id = ? AND source_conversation_id = ? AND LOWER(summary) = ? LIMIT 1",
+      args: [input.userId, input.conversationId, normalized],
+    });
+    return String(existing.rows[0]?.id ?? id);
+  });
+}
+
+export async function findRelevantMemoryItems(userId: string, query: string, limit = 12) {
+  await ensureSchema();
+  const terms = [...new Set((query.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? []).filter((term) => term.length > 2 && !["what", "about", "with", "from", "that", "this", "were", "discussed", "talked", "asked", "previously"].includes(term)))].slice(0, 8);
+  if (!terms.length) return [];
+  const matches = terms.map(() => "(LOWER(mi.summary) LIKE ? OR LOWER(mi.content) LIKE ?)").join(" OR ");
+  const result = await db.execute({
+    sql: `SELECT mi.id, mi.memory_type, mi.content, mi.summary, mi.source_conversation_id, mi.created_at
+          FROM memory_items mi WHERE mi.user_id = ? AND (${matches})
+          ORDER BY mi.updated_at DESC LIMIT ?`,
+    args: [userId, ...terms.flatMap((term) => [`%${term}%`, `%${term}%`]), Math.min(limit, 50)],
+  });
+  return result.rows;
 }
 
 export async function getRecentMessages(
@@ -181,15 +279,18 @@ export async function getRecentMessages(
 
 const normalizeEntityName = (name: string) => name.trim().toLocaleLowerCase("en-US");
 
-export async function saveResearchSession(input: Omit<ResearchSession, "id"> & { id?: string }) {
+export async function saveResearchSession(input: Omit<ResearchSession, "id"> & { id?: string; userId?: string }) {
   await ensureSchema();
   const id = input.id ?? randomUUID();
+  const userId = input.userId ?? LOCAL_USER_ID;
   await withWriteLock(async () => {
-    await db.execute({ sql: "INSERT OR IGNORE INTO conversations (id) VALUES (?)", args: [input.conversationId] });
+    await db.execute({ sql: "INSERT OR IGNORE INTO conversations (id, user_id) VALUES (?, ?)", args: [input.conversationId, userId] });
+    const owner = await db.execute({ sql: "SELECT user_id FROM conversations WHERE id = ?", args: [input.conversationId] });
+    if (String(owner.rows[0]?.user_id) !== userId) throw new Error("Research conversation owner mismatch");
     await db.execute({
-      sql: `INSERT INTO research_sessions (id, conversation_id, topic, summary, researched_at)
-            VALUES (?, ?, ?, ?, ?)`,
-      args: [id, input.conversationId, input.topic, input.summary, input.researchedAt],
+      sql: `INSERT INTO research_sessions (id, conversation_id, user_id, topic, summary, researched_at)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      args: [id, input.conversationId, userId, input.topic, input.summary, input.researchedAt],
     });
   });
   return { ...input, id };
@@ -210,6 +311,7 @@ export async function findEntities(names: string[]) {
 
 export async function findResearchSessions(input: {
   conversationId?: string;
+  userId?: string;
   topic?: string;
   entityNames?: string[];
   limit?: number;
@@ -220,6 +322,10 @@ export async function findResearchSessions(input: {
   if (input.conversationId) {
     conditions.push("rs.conversation_id = ?");
     args.push(input.conversationId);
+  }
+  if (input.userId) {
+    conditions.push("rs.user_id = ?");
+    args.push(input.userId);
   }
   if (input.topic?.trim()) {
     conditions.push("LOWER(rs.topic) LIKE ?");
