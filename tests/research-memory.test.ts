@@ -34,7 +34,7 @@ describe("structured research persistence", () => {
       summary: "Compared hosting options.",
       researchedAt: "2026-11-03T10:00:00.000Z",
     });
-    const messages = await memory.getRecentMessages("conversation-schema");
+    const messages = await memory.getRecentMessages(memory.LOCAL_USER_ID, "conversation-schema");
     const sessions = await memory.findResearchSessions({ conversationId: "conversation-schema" });
 
     expect(messages).toHaveLength(1);
@@ -219,6 +219,24 @@ describe("structured research persistence", () => {
     expect(otherHistory.flatMap((session) => session.observations).map((item) => item.value)).not.toContain("$19");
   });
 
+  it("deletes one owner's conversation, messages, memories and research only", async () => {
+    const { LOCAL_USER_ID, saveMessage, saveMemoryItem, deleteConversation } = await import("../src/lib/db");
+    await saveMessage("delete-chat-a", "user", "DeleteMe unique content", LOCAL_USER_ID);
+    await saveMessage("delete-chat-a", "assistant", "DeleteMe answer", LOCAL_USER_ID);
+    const session = await memory.saveResearchSession({ conversationId: "delete-chat-a", topic: "DeleteMe research", summary: "DeleteMe summary", researchedAt: "2026-11-10T10:00:00.000Z" });
+    await memory.saveObservations(session.id, [{ entity: { name: "DeleteMe Co", type: "company" }, source: { url: "https://delete-me.example", title: "DeleteMe source" }, attribute: "status", value: "old" }], session.researchedAt);
+    await saveMemoryItem({ userId: LOCAL_USER_ID, conversationId: "delete-chat-a", memoryType: "research", content: "DeleteMe memory", summary: "DeleteMe summary" });
+    await memory.db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: ["delete-other-user"] });
+    await saveMessage("delete-chat-b", "user", "DeleteMe other-owner conversation", "delete-other-user");
+
+    expect(await deleteConversation("delete-other-user", "delete-chat-a")).toBe(false);
+    expect(await deleteConversation(LOCAL_USER_ID, "delete-chat-a")).toBe(true);
+    expect((await memory.getRecentMessages(LOCAL_USER_ID, "delete-chat-a"))).toEqual([]);
+    expect((await memory.findResearchSessions({ conversationId: "delete-chat-a" }))).toEqual([]);
+    expect((await memory.db.execute({ sql: "SELECT id FROM memory_items WHERE source_conversation_id = ?", args: ["delete-chat-a"] })).rows).toEqual([]);
+    expect((await memory.getRecentMessages("delete-other-user", "delete-chat-b")).map((row) => row.content)).toContain("DeleteMe other-owner conversation");
+  });
+
   it("rejects observations with missing foreign-key parents", async () => {
     await expect(memory.db.execute({
       sql: `INSERT INTO observations
@@ -251,7 +269,7 @@ describe("structured research persistence", () => {
 
 describe("evidence validation and comparison outcomes", () => {
   it("parses ordinal day-first dates and handles UTC messages in the user's local day", async () => {
-    const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion } = await import("../src/agent/history-recall");
+    const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion, selectRecallTurns } = await import("../src/agent/history-recall");
     const date = parseRecallDate("what we discussed about Meta on 13th nov", "Asia/Kolkata", new Date("2026-11-13T00:00:00Z"));
 
     expect(date).toEqual({ year: 2026, month: 10, day: 13 });
@@ -260,6 +278,17 @@ describe("evidence validation and comparison outcomes", () => {
     expect(isHistoryRecallQuestion("what we discussed about the meta on 13th nov")).toBe(true);
     expect(historyRecallTopic("What did I ask you on 3 November?")).toBe("");
     expect(historyRecallTopic("what we discussed about the meta on 13th nov")).toBe("meta");
+    const turns = selectRecallTurns([
+      { id: 1, conversation_id: "old-meta", role: "user", content: "Why is Meta not in the frontier AI race?", created_at: "2026-11-12 20:56:59" },
+      { id: 2, conversation_id: "old-meta", role: "assistant", content: "We discussed its open-weight strategy, business incentives, and benchmark performance.", created_at: "2026-11-12 20:57:08" },
+      { id: 3, conversation_id: "current", role: "user", content: "search the other chat and find the one where we discussed Meta", created_at: "2026-11-12 21:14:17" },
+      { id: 4, conversation_id: "current", role: "assistant", content: "I do not have access to your other chat sessions.", created_at: "2026-11-12 21:14:23" },
+      { id: 5, conversation_id: "current", role: "user", content: "what we discussed about the meta on 13th nov", created_at: "2026-11-12 21:17:03" },
+      { id: 6, conversation_id: "current", role: "assistant", content: "I have no record of our previous conversation history.", created_at: "2026-11-12 21:17:10" },
+    ], "meta");
+    expect(turns).toHaveLength(1);
+    expect(turns[0]?.question).toBe("Why is Meta not in the frontier AI race?");
+    expect(turns[0]?.answer).toContain("open-weight strategy");
   });
 
   it("discards invalid extraction output and unsupported source claims", async () => {

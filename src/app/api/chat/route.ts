@@ -1,10 +1,11 @@
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import { auth } from "@clerk/nextjs/server";
 
 import { runResearchAgent } from "@/agent/orchestrator";
 import { findRelevantResearch, recordResearch } from "@/agent/research-memory";
-import { dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate } from "@/agent/history-recall";
+import { dateWindowUtc, historyRecallTopic, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate, selectRecallTurns } from "@/agent/history-recall";
 import type { SearchHit } from "@/tools/web-search";
 import {
   ensureSchema,
@@ -13,7 +14,7 @@ import {
   searchUserMessages,
   findRelevantMemoryItems,
   saveMemoryItem,
-  LOCAL_USER_ID,
+  deleteConversation,
 } from "@/lib/db";
 
 
@@ -22,7 +23,28 @@ const RequestSchema = z.object({
   conversationId: z.string().min(1).max(100).optional(),
   streamMode: z.enum(["text", "events"]).optional(),
   timeZone: z.string().max(100).optional(),
+  webSearchEnabled: z.boolean().optional().default(true),
 });
+
+const DeleteSchema = z.object({ conversationId: z.string().min(1).max(100) });
+
+function clerkIsConfigured() {
+  return Boolean(process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY && process.env.CLERK_SECRET_KEY);
+}
+
+export async function DELETE(request: Request) {
+  try {
+    if (!clerkIsConfigured()) return Response.json({ error: "Authentication is not configured." }, { status: 503 });
+    const { userId } = await auth();
+    if (!userId) return Response.json({ error: "Sign in to manage your research." }, { status: 401 });
+    const { conversationId } = DeleteSchema.parse(await request.json());
+    await ensureSchema();
+    const deleted = await deleteConversation(userId, conversationId);
+    return Response.json({ deleted }, { status: deleted ? 200 : 404 });
+  } catch (error) {
+    return Response.json({ error: error instanceof z.ZodError ? "Invalid conversation ID" : "Unable to delete this conversation" }, { status: error instanceof z.ZodError ? 400 : 500 });
+  }
+}
 
 function event(data: Record<string, unknown>) {
   return `${JSON.stringify(data)}\n`;
@@ -32,9 +54,20 @@ function formatRequestedDate(date: { year: number; month: number; day: number },
   return new Intl.DateTimeFormat("en-US", { dateStyle: "long", timeZone }).format(new Date(Date.UTC(date.year, date.month, date.day)));
 }
 
+function cleanRecalledAnswer(answer: string) {
+  return answer
+    .replace(/\[(?:https?:\/\/|(?:[a-z0-9-]+\.)+[a-z]{2,}\/)[^\]]{160,}\]/gi, "[long citation omitted]")
+    .replace(/https?:\/\/\S{180,}/gi, "[long citation omitted]")
+    .trim()
+    .slice(0, 1800);
+}
+
 export async function POST(request: Request) {
   const requestStartedAt = Date.now();
   try {
+    if (!clerkIsConfigured()) return Response.json({ error: "Authentication is not configured." }, { status: 503 });
+    const { userId } = await auth();
+    if (!userId) return Response.json({ error: "Sign in to start a research conversation." }, { status: 401 });
     const body = RequestSchema.parse(await request.json());
 
     const conversationId =
@@ -49,26 +82,26 @@ export async function POST(request: Request) {
     let recallRows: Awaited<ReturnType<typeof searchUserMessages>> = [];
     if (recallRequested) {
       const dateWindow = requestedDate ? dateWindowUtc(requestedDate) : {};
-      recallRows = await searchUserMessages({ userId: LOCAL_USER_ID, query: requestedDate ? historyRecallTopic(body.message) : body.message, ...dateWindow, limit: requestedDate ? 100 : 40 });
+      const queryTopic = historyRecallTopic(body.message);
+      recallRows = await searchUserMessages({ userId, query: requestedDate ? "" : queryTopic || body.message, ...dateWindow, limit: requestedDate ? 100 : 40 });
       if (requestedDate) recallRows = recallRows.filter((row) => sameDate(localDateParts(String(row.created_at), timeZone), requestedDate));
     }
 
     if (recallRequested) {
-      const recallTranscript = recallRows
-        .filter((row) => {
-          if (String(row.conversation_id) !== conversationId) return true;
-          const content = String(row.content);
-          if (isHistoryRecallQuestion(content)) return false;
-          return !(String(row.role) === "assistant" && /(?:don't|do not|cannot|can't) have access to (?:any )?(?:previous|other|past|separate)|no record of our previous/i.test(content));
-        })
-        .map((row) => `${String(row.role) === "user" ? "You" : "Minimi"}: ${String(row.content).trim().slice(0, 5000)}`)
-        .slice(-10);
+      const turns = selectRecallTurns(recallRows.map((row) => ({
+        id: String(row.id),
+        conversation_id: String(row.conversation_id),
+        role: String(row.role),
+        content: String(row.content),
+        created_at: String(row.created_at),
+      })), historyRecallTopic(body.message));
+      const recallTranscript = turns.map((turn) => `You asked: “${turn.question}”${turn.answer ? `\n\nMinimi answered: ${cleanRecalledAnswer(turn.answer)}` : "\n\nI found the question, but no saved answer."}`);
       const recallAnswer = recallTranscript.length
-        ? `${requestedDate ? `I found this saved discussion from ${formatRequestedDate(requestedDate, timeZone)}:` : "I found this saved discussion:"}\n\n${recallTranscript.join("\n\n")}`
+        ? `${requestedDate ? `I found this saved discussion from ${formatRequestedDate(requestedDate, timeZone)}:` : "I found this saved discussion:"}\n\n${recallTranscript.join("\n\n---\n\n")}`
         : `I couldn't find a saved discussion${requestedDate ? ` dated ${formatRequestedDate(requestedDate, timeZone)}` : " matching that topic"} in this local Minimi database.`;
 
-      await saveMessage(conversationId, "user", body.message, LOCAL_USER_ID);
-      await saveMessage(conversationId, "assistant", recallAnswer, LOCAL_USER_ID);
+      await saveMessage(conversationId, "user", body.message, userId);
+      await saveMessage(conversationId, "assistant", recallAnswer, userId);
       const responseBody = body.streamMode === "events"
         ? `${event({ type: "delta", text: recallAnswer })}${event({ type: "done" })}`
         : recallAnswer;
@@ -76,8 +109,8 @@ export async function POST(request: Request) {
     }
 
     // Save current user input only after the global history lookup above.
-    await saveMessage(conversationId, "user", body.message, LOCAL_USER_ID);
-    const history = await getRecentMessages(conversationId, 15);
+    await saveMessage(conversationId, "user", body.message, userId);
+    const history = await getRecentMessages(userId, conversationId, 15);
     const messages: Array<{ role: "user" | "assistant"; content: string }> = history.map((row) => ({
       role: String(row.role) === "assistant" ? "assistant" : "user",
       content: String(row.content),
@@ -91,8 +124,8 @@ export async function POST(request: Request) {
     let historicalContext: string | undefined;
     const retrievalStartedAt = Date.now();
     try {
-      const priorResearch = await findRelevantResearch(LOCAL_USER_ID, retrievalQuery, body.message, true);
-      const priorMemories = await findRelevantMemoryItems(LOCAL_USER_ID, body.message);
+      const priorResearch = await findRelevantResearch(userId, retrievalQuery, body.message, true);
+      const priorMemories = await findRelevantMemoryItems(userId, body.message);
       if (priorResearch.length || priorMemories.length) {
         historicalContext = JSON.stringify({ storedEvidence: priorResearch, durableMemories: priorMemories });
       }
@@ -111,12 +144,13 @@ export async function POST(request: Request) {
       onSearchCall: (count) => { searchCallCount += count; },
       onModelStep: () => { modelCallCount += 1; },
       historicalContext,
+      webSearchEnabled: body.webSearchEnabled,
       onFinish: async (text) => {
         await saveMessage(
           conversationId,
           "assistant",
           text,
-          LOCAL_USER_ID,
+          userId,
         );
         try {
           const shouldRemember = searchHits.length > 0 || /\b(meta|project|decision|decided|prefer|preference|remember|architecture|technical|bug|stack|pricing|plan|research|working on|building)\b/i.test(body.message);
@@ -124,7 +158,7 @@ export async function POST(request: Request) {
             ? "technical_context"
             : searchHits.length ? "research" : "important_discussions";
           if (shouldRemember) await saveMemoryItem({
-              userId: LOCAL_USER_ID,
+              userId,
               conversationId,
               memoryType,
               content: `User asked: ${body.message}\nAssistant answered: ${text.slice(0, 12000)}`,
@@ -135,6 +169,7 @@ export async function POST(request: Request) {
         }
         try {
           await recordResearch({
+            userId,
             conversationId,
             question: body.message,
             answer: text,

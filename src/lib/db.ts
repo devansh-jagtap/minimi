@@ -35,8 +35,8 @@ export type ResearchObservation = {
   validFrom?: string;
 };
 
-// This app currently has no authentication. This stable server-side owner key
-// is suitable only for a single-user local installation.
+// Unclaimed records from the pre-auth local installation remain isolated here
+// until an authenticated user explicitly imports matching local conversations.
 export const LOCAL_USER_ID = process.env.MINIMI_LOCAL_USER_ID?.trim() || "local-single-user";
 
 export type StoredObservation = ResearchObservation & {
@@ -192,6 +192,7 @@ export async function saveMessage(
 ) {
   await ensureSchema();
   await withWriteLock(async () => {
+    await db.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: [userId] });
     await db.execute({
       sql: `INSERT OR IGNORE INTO conversations (id, user_id) VALUES (?, ?)`,
       args: [conversationId, userId],
@@ -215,7 +216,7 @@ export async function searchUserMessages(input: { userId: string; query: string;
   const dateCondition = input.startUtc && input.endUtc ? "AND m.created_at >= ? AND m.created_at < ?" : "";
   if (!conditions && !dateCondition) return [];
   const result = await db.execute({
-    sql: `SELECT m.conversation_id, m.role, m.content, m.created_at
+    sql: `SELECT m.id, m.conversation_id, m.role, m.content, m.created_at
           FROM messages m JOIN conversations c ON c.id = m.conversation_id
           WHERE c.user_id = ? ${dateCondition}
           ${conditions ? `AND (${conditions})` : ""}
@@ -259,19 +260,83 @@ export async function findRelevantMemoryItems(userId: string, query: string, lim
   return result.rows;
 }
 
+export async function deleteConversation(userId: string, conversationId: string) {
+  await ensureSchema();
+  return withWriteLock(async () => {
+    const transaction = await db.transaction("write");
+    try {
+      const owner = await transaction.execute({ sql: "SELECT user_id FROM conversations WHERE id = ?", args: [conversationId] });
+      if (!owner.rows.length || String(owner.rows[0].user_id) !== userId) {
+        await transaction.rollback();
+        return false;
+      }
+      const sessions = await transaction.execute({ sql: "SELECT id FROM research_sessions WHERE conversation_id = ? AND user_id = ?", args: [conversationId, userId] });
+      const sessionIds = sessions.rows.map((row) => String(row.id));
+      if (sessionIds.length) {
+        const placeholders = sessionIds.map(() => "?").join(",");
+        await transaction.execute({ sql: `DELETE FROM observations WHERE research_session_id IN (${placeholders})`, args: sessionIds });
+      }
+      await transaction.execute({ sql: "DELETE FROM research_sessions WHERE conversation_id = ? AND user_id = ?", args: [conversationId, userId] });
+      await transaction.execute({ sql: "DELETE FROM memory_items WHERE source_conversation_id = ? AND user_id = ?", args: [conversationId, userId] });
+      await transaction.execute({ sql: "DELETE FROM messages WHERE conversation_id = ?", args: [conversationId] });
+      await transaction.execute({ sql: "DELETE FROM conversations WHERE id = ? AND user_id = ?", args: [conversationId, userId] });
+      await transaction.execute("DELETE FROM sources WHERE NOT EXISTS (SELECT 1 FROM observations WHERE observations.source_id = sources.id)");
+      await transaction.execute("DELETE FROM entities WHERE NOT EXISTS (SELECT 1 FROM observations WHERE observations.entity_id = entities.id)");
+      await transaction.commit();
+      return true;
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+  });
+}
+
+export async function claimLegacyConversations(userId: string, conversationIds: string[]) {
+  await ensureSchema();
+  const ids = [...new Set(conversationIds)].slice(0, 100);
+  if (!ids.length) return [];
+  return withWriteLock(async () => {
+    const transaction = await db.transaction("write");
+    try {
+      await transaction.execute({ sql: "INSERT OR IGNORE INTO local_users (id) VALUES (?)", args: [userId] });
+      const placeholders = ids.map(() => "?").join(",");
+      const legacyOwnerIds = [...new Set([LOCAL_USER_ID, "local-single-user"])];
+      const ownerPlaceholders = legacyOwnerIds.map(() => "?").join(",");
+      const candidates = await transaction.execute({
+        sql: `SELECT id FROM conversations WHERE id IN (${placeholders}) AND user_id IN (${ownerPlaceholders})`,
+        args: [...ids, ...legacyOwnerIds],
+      });
+      const claimedIds = candidates.rows.map((row) => String(row.id));
+      if (claimedIds.length) {
+        const claimedPlaceholders = claimedIds.map(() => "?").join(",");
+        const args = [userId, ...claimedIds, ...legacyOwnerIds];
+        await transaction.execute({ sql: `UPDATE conversations SET user_id = ? WHERE id IN (${claimedPlaceholders}) AND user_id IN (${ownerPlaceholders})`, args });
+        await transaction.execute({ sql: `UPDATE memory_items SET user_id = ? WHERE source_conversation_id IN (${claimedPlaceholders}) AND user_id IN (${ownerPlaceholders})`, args });
+        await transaction.execute({ sql: `UPDATE research_sessions SET user_id = ? WHERE conversation_id IN (${claimedPlaceholders}) AND user_id IN (${ownerPlaceholders})`, args });
+      }
+      await transaction.commit();
+      return claimedIds;
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+  });
+}
+
 export async function getRecentMessages(
+  userId: string,
   conversationId: string,
   limit = 15
 ) {
   await ensureSchema();
 
   const result = await db.execute({
-    sql: `SELECT role, content, created_at
-          FROM messages
-          WHERE conversation_id = ?
-          ORDER BY id DESC
+    sql: `SELECT m.role, m.content, m.created_at
+          FROM messages m JOIN conversations c ON c.id = m.conversation_id
+          WHERE m.conversation_id = ? AND c.user_id = ?
+          ORDER BY m.id DESC
           LIMIT ?`,
-    args: [conversationId, limit],
+    args: [conversationId, userId, limit],
   });
 
   return result.rows.reverse();

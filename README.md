@@ -5,8 +5,18 @@ Minimi is a persistent web research assistant built with Next.js App Router, Typ
 ## Setup
 
 1. Copy `.env.example` to `.env.local` and provide your Google AI and Tavily keys.
-2. Install dependencies with `bun install`.
-3. Start the app with `bun run dev` and open [http://localhost:3000](http://localhost:3000).
+2. Open the selected Clerk application (`app_3M1cyqyRyVegjHarhz8IBomUHvO`) in the Clerk Dashboard and go to **API Keys**. Copy its development Publishable Key and Secret Key into `.env.local`:
+
+   ```env
+   NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
+   CLERK_SECRET_KEY=sk_test_...
+   ```
+
+   Keep `CLERK_SECRET_KEY` private and out of Git. The app requires both keys before it serves the workspace. On this Windows setup, the Clerk CLI binary is blocked by Application Control, so use the Dashboard instead of `bunx clerk`.
+3. Install dependencies with `bun install`.
+4. Start the app with `bun run dev` and open [http://localhost:3000](http://localhost:3000). Sign in or create an account to use Minimi.
+
+The first account that signs in on a browser can import its saved pre-auth chats. Those chats are moved to that account's storage namespace and matching local database records are claimed once. Each account gets a separate conversation namespace and server-side owner scope.
 
 Useful commands:
 
@@ -33,4 +43,4 @@ The schema is created additively and idempotently on first database use. Existin
 
 ## Tests
 
-`bun run test` uses a temporary LibSQL database and deterministic fixtures. CRM shortlist, date recall, and Postgres-hosting cases are fixtures; they do not claim that current vendor prices or product changes were checked live. Live research requires configured Google AI and Tavily credentials.
+`bun run test` uses a temporary LibSQL database and deterministic fixtures. CRM shortlist, date recall, and Postgres-hosting cases are fixtures; they do not claim that current vendor prices or product changes were checked live. Live research requires configured Google AI and Tavily credentials. Account-based chat and memory require configured Clerk keys.
