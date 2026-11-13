@@ -8,13 +8,13 @@ import { db, ensureSchema } from "@/lib/db";
 import { getDocumentBucket, getObjectStorageClient, getPresignedUrlTtlSeconds } from "@/lib/object-storage";
 
 const MAX_BYTES = Math.min(Number(process.env.MINIMI_DOCUMENT_MAX_BYTES) || 25 * 1024 * 1024, 25 * 1024 * 1024);
-const EXTENSIONS: Record<string, string> = {
-  "application/pdf": ".pdf",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-  "text/plain": ".txt",
-  "image/png": ".png",
-  "image/jpeg": ".jpg",
-  "image/webp": ".webp",
+const EXTENSIONS: Record<string, string[]> = {
+  "application/pdf": [".pdf"],
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+  "text/plain": [".txt"],
+  "image/png": [".png"],
+  "image/jpeg": [".jpg", ".jpeg"],
+  "image/webp": [".webp"],
 };
 const IntentSchema = z.object({
   conversationId: z.string().min(1).max(100),
@@ -51,7 +51,7 @@ export async function POST(request: Request) {
   const mimeType = input.mimeType.toLowerCase();
   const extension = EXTENSIONS[mimeType];
   const filename = input.filename.replace(/[/\\\0-\x1f]/g, "_").trim();
-  if (!extension || !filename.toLowerCase().endsWith(extension) || input.sizeBytes > MAX_BYTES) {
+  if (!extension || !extension.some((suffix) => filename.toLowerCase().endsWith(suffix)) || input.sizeBytes > MAX_BYTES) {
     return Response.json({ error: "Unsupported file type, extension, or size." }, { status: 415 });
   }
   try {
