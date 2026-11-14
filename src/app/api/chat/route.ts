@@ -88,7 +88,7 @@ export async function POST(request: Request) {
     if (recallRequested) {
       const dateWindow = requestedDate ? dateWindowUtc(requestedDate, timeZone) : {};
       const queryTopic = historyRecallTopic(body.message);
-      recallRows = await searchUserMessages({ userId, query: requestedDate ? "" : queryTopic || body.message, ...dateWindow, limit: requestedDate ? 100 : 40 });
+      recallRows = await searchUserMessages({ userId, query: requestedDate ? "" : queryTopic, ...dateWindow, limit: requestedDate ? 100 : 40 });
       if (requestedDate) recallRows = recallRows.filter((row) => sameDate(localDateParts(String(row.created_at), timeZone), requestedDate));
     }
 
@@ -133,19 +133,20 @@ export async function POST(request: Request) {
     const [historicalResult, documentContext] = await Promise.all([
       (async () => {
         try {
-          const priorResearch = await findRelevantResearch(userId, body.message, body.message, true, timeZone);
-          const priorMemories = priorResearch.length ? [] : await findRelevantMemoryItems(userId, body.message, 4);
-          return priorResearch.length || priorMemories.length
-            ? JSON.stringify({
-                storedEvidence: priorResearch,
-                durableMemories: priorMemories.map((memory) => ({
+          const [priorResearch, priorMemories] = await Promise.all([
+            findRelevantResearch(userId, body.message, body.message, true, timeZone),
+            findRelevantMemoryItems(userId, body.message, 4),
+          ]);
+          const sections = [
+            priorMemories.length ? `A. RELEVANT HISTORICAL CONVERSATION SUMMARIES\n${JSON.stringify(priorMemories.map((memory) => ({
                   type: String(memory.memory_type),
                   summary: String(memory.summary).slice(0, 240),
-                  content: String(memory.content).slice(0, 500),
+                  supportingExcerpt: String(memory.content).slice(0, 320),
                   createdAt: String(memory.created_at),
-                })),
-              })
-            : undefined;
+                })))}` : "",
+            priorResearch.length ? `B. RELEVANT STRUCTURED RESEARCH OBSERVATIONS\n${JSON.stringify(priorResearch)}` : "",
+          ].filter(Boolean);
+          return sections.length ? sections.join("\n\n") : undefined;
         } catch (error) {
           console.error("[Minimi] Historical research retrieval failed:", error);
           return undefined;

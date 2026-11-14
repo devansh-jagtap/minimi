@@ -2,6 +2,7 @@ import { generateObject } from "ai";
 import { z } from "zod";
 
 import { model } from "@/lib/ai";
+import { topicOverlap, topicTerms } from "@/lib/topic-relevance";
 import {
   findResearchSessions,
   getObservations,
@@ -165,27 +166,13 @@ export function classifyObservationComparison(
     : "Changed";
 }
 
-const STOP_WORDS = new Set([
-  "a", "about", "after", "any", "are", "asked", "before", "changed", "changes",
-  "did", "does", "for", "from", "has", "have", "how", "i", "in", "is", "it",
-  "me", "my", "of", "on", "or", "our", "please", "since", "the", "them", "then",
-  "there", "these", "they", "this", "those", "to", "was", "we", "were", "what",
-  "when", "which", "who", "with", "you", "your", "still", "today", "now",
-]);
-
-const terms = (value: string) => new Set(
-  (value.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? [])
-    .flatMap((term) => [term, ...term.split("-")])
-    .filter((term) => term.length > 1 && !STOP_WORDS.has(term)),
-);
-
 export function temporalMatch(query: string, timestamp: string, timeZone = "UTC", now = new Date()) {
   const requestedDate = parseRecallDate(query, timeZone, now);
   return requestedDate ? sameDate(localDateParts(timestamp, timeZone), requestedDate) : false;
 }
 
 export async function findRelevantResearch(ownerId: string, query: string, temporalQuery = query, globalUserScope = false, timeZone = "UTC") {
-  const entityTerms = [...terms(temporalQuery)].slice(0, 12);
+  const entityTerms = [...topicTerms(temporalQuery)].slice(0, 12);
   const sessionSets = globalUserScope && entityTerms.length
     ? await Promise.all([
         findResearchSessions({ userId: ownerId, limit: 50 }),
@@ -198,7 +185,7 @@ export async function findRelevantResearch(ownerId: string, query: string, tempo
 
   const sessionIds = sessions.map((session) => String(session.id));
   const observations = await getObservations({ sessionIds, limit: 500 });
-  const queryTerms = terms(`${query} ${temporalQuery}`);
+  const queryTerms = topicTerms(`${query} ${temporalQuery}`);
   const scored = sessions.map((session) => {
     const sessionObservations = observations.filter(
       (observation) => String(observation.research_session_id) === String(session.id),
@@ -206,7 +193,7 @@ export async function findRelevantResearch(ownerId: string, query: string, tempo
       const relevance = (observation: typeof a) => {
         const entity = String(observation.display_name);
         const entityMatch = temporalQuery.toLocaleLowerCase("en-US").includes(entity.toLocaleLowerCase("en-US"));
-        const evidenceTerms = terms(`${String(observation.attribute)} ${String(observation.value)}`);
+        const evidenceTerms = topicTerms(`${String(observation.attribute)} ${String(observation.value)}`);
         const attributeMatches = [...queryTerms].filter((term) => evidenceTerms.has(term)).length;
         return (entityMatch ? 8 : 0) + attributeMatches * 2;
       };
@@ -216,24 +203,23 @@ export async function findRelevantResearch(ownerId: string, query: string, tempo
     const entityMatches = entities.filter((entity) =>
       temporalQuery.toLocaleLowerCase("en-US").includes(entity.toLocaleLowerCase("en-US")),
     );
-    const topicTerms = terms(`${String(session.topic)} ${String(session.summary)}`);
-    const topicMatches = [...queryTerms].filter((term) => topicTerms.has(term));
+    const topicMatches = topicOverlap(temporalQuery, `${String(session.topic)} ${String(session.summary)}`);
     const isDateMatch = temporalMatch(temporalQuery, String(session.researched_at), timeZone);
     return { session, sessionObservations, entityMatches, topicMatches, isDateMatch, score: entityMatches.length * 3 + topicMatches.length + (isDateMatch ? 10 : 0) };
   });
-  const hasDirectEntityMatches = scored.some((item) => item.entityMatches.length > 0);
-  const relevant = scored.filter((item) => hasDirectEntityMatches
-    ? item.entityMatches.length > 0
-    : item.isDateMatch || item.topicMatches.length >= 2)
+  const relevant = scored.filter((item) =>
+    item.entityMatches.length > 0 || item.isDateMatch || item.topicMatches.length >= 1)
     .sort((a, b) => b.score - a.score || String(b.session.researched_at).localeCompare(String(a.session.researched_at)))
     .slice(0, 5);
 
-  return relevant.map(({ session, sessionObservations }) => ({
+  return relevant.map(({ session, sessionObservations, entityMatches }) => ({
     session: {
       topic: String(session.topic),
       researchedAt: String(session.researched_at),
     },
-    observations: sessionObservations.slice(0, 12).map((observation) => ({
+    observations: sessionObservations
+      .filter((observation) => !entityMatches.length || entityMatches.includes(String(observation.display_name)))
+      .slice(0, 12).map((observation) => ({
       entity: String(observation.display_name),
       entityType: String(observation.entity_type),
       attribute: String(observation.attribute),

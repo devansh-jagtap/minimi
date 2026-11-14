@@ -1,11 +1,13 @@
+import { topicOverlap } from "@/lib/topic-relevance";
+
 const MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
 
 export type CalendarDate = { year: number; month: number; day: number };
 
 export function isHistoryRecallQuestion(query: string) {
-  return /\b(what|which|remind|recall|discuss(?:ed|ion)?|asked|talked)\b/i.test(query)
-    && /\b(ask(?:ed)?|discuss(?:ed|ion)?|talked|conversation|chat|question|history|remember)\b/i.test(query)
-    && /\b(on|about|from|last|previous|past|earlier)\b/i.test(query);
+  return /\b(what|which|where|remind|recall|remember|discuss(?:ed|ion)?|asked|talked|compar(?:e|ed|ing))\b/i.test(query)
+    && /\b(ask(?:ed)?|discuss(?:ed|ion)?|talked|compar(?:e|ed|ing)|conversation|chat|question|history|remember)\b/i.test(query)
+    && /\b(on|about|from|last|previous|past|earlier|where)\b/i.test(query);
 }
 
 export function historyRecallTopic(query: string) {
@@ -16,7 +18,7 @@ export function historyRecallTopic(query: string) {
     .replace(new RegExp(`\\b(?:${monthPattern})\\b`, "gi"), " ")
     .replace(new RegExp(`\\b(?:${weekdayPattern})\\b`, "gi"), " ")
     .replace(/\b\d{1,2}(?:st|nd|rd|th)?\b/g, " ")
-    .replace(/\b(what|which|did|do|i|we|you|me|my|our|the|a|an|on|in|at|from|about|previously|earlier|last|conversation|chat|discussed|discussion|talked|asked|ask|remember|recall|tell|remind)\b/gi, " ")
+    .replace(/\b(what|which|where|did|do|i|we|you|me|my|our|the|a|an|on|in|at|from|about|previously|earlier|last|conversation|chat|discussed|discussion|talked|asked|ask|remember|recall|tell|remind|compare|compared|comparing)\b/gi, " ")
     .replace(/[^a-z0-9.+#-]+/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -121,7 +123,7 @@ function isFailedRecallAnswer(answer: string) {
 }
 
 export function selectRecallTurns(rows: RecallRow[], topic: string, limit = 5) {
-  const terms = [...new Set((topic.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? []).filter((term) => term.length > 2))];
+  if (!topicOverlap(topic, topic).length) return [];
   const conversations = new Map<string, RecallRow[]>();
   for (const row of rows) {
     const group = conversations.get(row.conversation_id) ?? [];
@@ -135,8 +137,8 @@ export function selectRecallTurns(rows: RecallRow[], topic: string, limit = 5) {
     conversationRows.forEach((row, index) => {
       if (row.role !== "user" || isHistoryRecallQuestion(row.content)) return;
       const question = row.content.trim();
-      const matchedTerms = terms.filter((term) => question.toLocaleLowerCase("en-US").includes(term));
-      if (terms.length && matchedTerms.length === 0) return;
+      const matchedTerms = topicOverlap(topic, question);
+      if (!matchedTerms.length) return;
       const answerRow = conversationRows.slice(index + 1).find((candidate) => candidate.role === "assistant");
       const answer = answerRow?.content.trim() ?? "";
       if (isFailedRecallAnswer(answer)) return;

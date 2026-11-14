@@ -1,6 +1,7 @@
 
 import { createClient } from "@libsql/client";
 import { createHash, randomUUID } from "node:crypto";
+import { topicOverlap, topicTerms } from "@/lib/topic-relevance";
 
 const url = process.env.DATABASE_URL;
 
@@ -273,7 +274,7 @@ export async function saveMessage(
 
 export async function searchUserMessages(input: { userId: string; query: string; startUtc?: string; endUtc?: string; limit?: number }) {
   await ensureSchema();
-  const terms = [...new Set((input.query.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? []).filter((term) => term.length > 2 && !["what", "about", "with", "from", "that", "this", "were", "discussed", "talked", "asked"].includes(term)))].slice(0, 6);
+  const terms = [...topicTerms(input.query)].slice(0, 8);
   const conditions = terms.map(() => "LOWER(m.content) LIKE ?").join(" OR ");
   const dateCondition = input.startUtc && input.endUtc ? "AND m.created_at >= ? AND m.created_at < ?" : "";
   if (!conditions && !dateCondition) return [];
@@ -310,7 +311,7 @@ export async function saveMemoryItem(input: { userId: string; conversationId: st
 
 export async function findRelevantMemoryItems(userId: string, query: string, limit = 12) {
   await ensureSchema();
-  const terms = [...new Set((query.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? []).filter((term) => term.length > 2 && !["what", "about", "with", "from", "that", "this", "were", "discussed", "talked", "asked", "previously"].includes(term)))].slice(0, 8);
+  const terms = [...topicTerms(query)].slice(0, 8);
   if (!terms.length) return [];
   const matches = terms.map(() => "(LOWER(mi.summary) LIKE ? OR LOWER(mi.content) LIKE ?)").join(" OR ");
   const result = await db.execute({
@@ -319,7 +320,12 @@ export async function findRelevantMemoryItems(userId: string, query: string, lim
           ORDER BY mi.updated_at DESC LIMIT ?`,
     args: [userId, ...terms.flatMap((term) => [`%${term}%`, `%${term}%`]), Math.min(limit, 50)],
   });
-  return result.rows;
+  return result.rows
+    .map((row) => ({ row, relevance: topicOverlap(query, String(row.summary)).length }))
+    .filter((item) => item.relevance > 0)
+    .sort((left, right) => right.relevance - left.relevance || String(right.row.created_at).localeCompare(String(left.row.created_at)))
+    .slice(0, Math.min(limit, 50))
+    .map(({ row }) => row);
 }
 
 export async function deleteConversation(userId: string, conversationId: string) {

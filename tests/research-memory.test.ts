@@ -481,6 +481,88 @@ describe("structured research persistence", () => {
   });
 });
 
+describe("owned cross-chat relevance retrieval", () => {
+  it("retrieves only the topic-matched conversation across PostgreSQL, CRM, unrelated, combined, paraphrased, and owner-scoped questions", async () => {
+    const ownerId = "topic-relevance-owner";
+    await memory.saveMessage("topic-postgres-chat", "user", "We compared Neon, Supabase, and Railway for PostgreSQL hosting.", ownerId);
+    await memory.saveMessage("topic-postgres-chat", "assistant", "Neon was simplest, Supabase had a generous free tier, Railway was easiest to deploy. We recommended Neon for production.", ownerId);
+    await memory.saveMessage("topic-crm-chat", "user", "We compared CRM platforms HubSpot, Pipedrive, Zoho CRM, Freshsales, and Salesforce for a sales team.", ownerId);
+    await memory.saveMessage("topic-crm-chat", "assistant", "Pipedrive was sales-focused; HubSpot was strong for inbound; Salesforce fit advanced requirements.", ownerId);
+    await memory.saveMessage("topic-other-user-chat", "user", "We compared PostgreSQL hosting providers privately.", "another-topic-owner");
+
+    const { historyRecallTopic, selectRecallTurns, isHistoryRecallQuestion } = await import("../src/agent/history-recall");
+    const recall = async (userId: string, question: string) => {
+      const topic = historyRecallTopic(question);
+      const rows = await memory.searchUserMessages({ userId, query: topic, limit: 40 });
+      return selectRecallTurns(rows.map((row) => ({
+        id: String(row.id),
+        conversation_id: String(row.conversation_id),
+        role: String(row.role),
+        content: String(row.content),
+        created_at: String(row.created_at),
+      })), topic);
+    };
+
+    const postgresQuestion = "Do you remember our previous discussion about PostgreSQL hosting? Which providers did we compare, what were the key findings, and what was your recommendation? Please retrieve the information from our earlier conversation rather than guessing.";
+    expect(isHistoryRecallQuestion(postgresQuestion)).toBe(true);
+    expect((await recall(ownerId, postgresQuestion)).map((turn) => turn.conversationId)).toEqual(["topic-postgres-chat"]);
+    expect((await recall(ownerId, "What did we previously compare about CRM platforms?")).map((turn) => turn.conversationId)).toEqual(["topic-crm-chat"]);
+    expect(await recall(ownerId, "What did we discuss about cloud security earlier?")).toEqual([]);
+
+    const both = await recall(ownerId, "What did we previously discuss about PostgreSQL hosting and CRM platforms?");
+    expect(new Set(both.map((turn) => turn.conversationId))).toEqual(new Set(["topic-postgres-chat", "topic-crm-chat"]));
+
+    const paraphrase = "Where did we compare database hosting providers?";
+    expect(isHistoryRecallQuestion(paraphrase)).toBe(true);
+    expect((await recall(ownerId, paraphrase)).map((turn) => turn.conversationId)).toEqual(["topic-postgres-chat"]);
+    expect(await recall("no-history-owner", postgresQuestion)).toEqual([]);
+  });
+
+  it("keeps structured research and durable memory scoped to the matching topic and owner", async () => {
+    const ownerId = "topic-research-owner";
+    await memory.saveMessage("topic-research-postgres", "user", "PostgreSQL research conversation.", ownerId);
+    await memory.saveMessage("topic-research-crm", "user", "CRM research conversation.", ownerId);
+    const postgres = await memory.saveResearchSession({
+      conversationId: "topic-research-postgres",
+      userId: ownerId,
+      topic: "PostgreSQL hosting providers",
+      summary: "Compared Neon, Supabase, and Railway database hosting.",
+      researchedAt: "2026-11-03T10:00:00.000Z",
+    });
+    await memory.saveObservations(postgres.id, [
+      { entity: { name: "Neon", type: "company" }, source: { url: "https://neon.example", title: "Neon" }, attribute: "Deployment", value: "Branching Postgres" },
+      { entity: { name: "Supabase", type: "company" }, source: { url: "https://supabase.example", title: "Supabase" }, attribute: "Free tier", value: "Generous free tier" },
+      { entity: { name: "Railway", type: "company" }, source: { url: "https://railway.example", title: "Railway" }, attribute: "Deployment", value: "Simple deployment" },
+    ], postgres.researchedAt);
+    const crm = await memory.saveResearchSession({
+      conversationId: "topic-research-crm",
+      userId: ownerId,
+      topic: "CRM platforms for sales teams",
+      summary: "Compared five CRM providers for a sales team.",
+      researchedAt: "2026-11-04T10:00:00.000Z",
+    });
+    await memory.saveObservations(crm.id, [
+      { entity: { name: "HubSpot", type: "company" }, source: { url: "https://hubspot.example", title: "HubSpot" }, attribute: "Plan", value: "Inbound sales" },
+      { entity: { name: "Pipedrive", type: "company" }, source: { url: "https://pipedrive.example", title: "Pipedrive" }, attribute: "Plan", value: "Sales pipeline" },
+    ], crm.researchedAt);
+    await memory.saveMemoryItem({ userId: ownerId, conversationId: "topic-research-postgres", memoryType: "research", summary: "Compared database hosting providers PostgreSQL Neon Supabase Railway", content: "User asked about PostgreSQL hosting. Recommendation was Neon for production.", });
+    await memory.saveMemoryItem({ userId: ownerId, conversationId: "topic-research-crm", memoryType: "research", summary: "Compared CRM platforms HubSpot Pipedrive Zoho Freshsales Salesforce", content: "CRM recommendation for sales team.", });
+
+    const { findRelevantResearch } = await import("../src/agent/research-memory");
+    const postgresEvidence = await findRelevantResearch(ownerId, "Where did we compare database hosting providers?", "Where did we compare database hosting providers?", true);
+    expect(postgresEvidence.map((session) => session.session.topic)).toEqual(["PostgreSQL hosting providers"]);
+    expect(new Set(postgresEvidence.flatMap((session) => session.observations.map((item) => item.entity)))).toEqual(new Set(["Neon", "Supabase", "Railway"]));
+    const crmEvidence = await findRelevantResearch(ownerId, "What did we compare about CRM platforms?", "What did we compare about CRM platforms?", true);
+    expect(crmEvidence.map((session) => session.session.topic)).toEqual(["CRM platforms for sales teams"]);
+    expect(await findRelevantResearch("unrelated-research-owner", "database hosting", "database hosting", true)).toEqual([]);
+
+    const { findRelevantMemoryItems } = await import("../src/lib/db");
+    expect((await findRelevantMemoryItems(ownerId, "database hosting providers")).map((item) => String(item.source_conversation_id))).toEqual(["topic-research-postgres"]);
+    expect(await findRelevantMemoryItems(ownerId, "cloud security" )).toEqual([]);
+    expect(await findRelevantMemoryItems("another-research-owner", "database hosting providers")).toEqual([]);
+  });
+});
+
 describe("evidence validation and comparison outcomes", () => {
   it("parses local-day dates and weekday references across UTC boundaries", async () => {
     const { parseRecallDate, localDateParts, sameDate, dateWindowUtc, formatCalendarDate, historyRecallTopic, isHistoryRecallQuestion, selectRecallTurns } = await import("../src/agent/history-recall");
