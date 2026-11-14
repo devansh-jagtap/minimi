@@ -1,79 +1,89 @@
-# Minimi architecture and structured research memory
+# Minimi — Design and Architecture
 
-## Request flow
+## 1. Purpose
 
-The Next.js App Router chat endpoint authenticates requests with Clerk. It accepts a message, optional conversation ID, browser time zone, stream mode, and web-search toggle. Conversation reads and writes are scoped to the Clerk user ID. The endpoint can retrieve global conversation memory and structured research evidence for that same authenticated user before it calls the Gemini model. The model has exactly one callable tool, `webSearch`, implemented with Tavily. Research-memory extraction runs after the answer and is an application-side Gemini structured-output call; it is not exposed as a model tool.
+Minimi is a persistent, time-aware AI research assistant. It is designed to answer new questions, recall relevant research from earlier conversations, verify whether historical findings remain accurate, and answer questions about user-uploaded documents.
 
-The route supports plain text and newline-delimited event streams. Search queries, search results, and answer text are streamed to the client; the expandable research-activity UI shows sources and elapsed time. This is tool activity, not a chain-of-thought display. Web search is enabled by default and can be disabled in the composer. Direct history-recall requests are answered from relevant saved user/assistant turns and structured observations without invoking web search. The selected history is private model context: Gemini writes a new answer rather than returning the stored transcript. Historical-versus-current questions retrieve the historical baseline and invoke the normal research agent so `webSearch` can gather fresh evidence when search is enabled.
+The central design principle is that **memory is evidence for a new answer, not a transcript to replay**. Historical observations are kept separate from current web evidence so the system can distinguish what it previously found from what it can verify now.
 
-## Authentication and ownership
+## 2. System architecture
 
-Clerk supplies the owner ID used in database operations. Conversation messages are read through a join to `conversations` with the matching `user_id`; writes verify the existing conversation owner. Research sessions and durable memory items have user ownership and are retrieved by the authenticated owner. Deletion checks ownership in a write transaction before removing a conversation and its dependent messages, memory, research sessions, and observations. Shared sources and entities are deleted only when no remaining observation references them.
+![Minimi system architecture](./docs/minimi-architecture.png)
 
-The legacy claim endpoint allows a signed-in user to claim listed conversations whose owner is the configured local owner or `local-single-user`. This is a migration path for a single-user local installation, not proof of which account originally created a legacy conversation; the client must only offer records the user intends to import. The ownership tests cover route-level data helpers and transaction behavior, but do not establish identity for ambiguous legacy records.
+A scalable [SVG version](./docs/minimi-architecture.svg) and the [diagram notes](./docs/architecture.md) are also available.
 
-## Database and migrations
+### Request and research flow
 
-The database is LibSQL. `ensureSchema()` creates tables and indexes with `CREATE ... IF NOT EXISTS`, then adds missing owner and comparison columns with `ALTER TABLE`. This is an idempotent additive migration path, not a version-numbered migration framework. Foreign-key checks are enabled on the application connection. A process-local write queue serializes writes made through one module instance; database write transactions provide the transaction boundaries. The process-local queue does not coordinate separate server processes.
+1. **Client:** The Next.js chat interface sends the message, conversation ID, browser time zone, and web-search preference to the chat API. It displays streamed answer text, citations, and search activity.
+2. **Authentication and ownership:** Clerk authenticates the request. The server uses the Clerk user ID as the owner scope for conversation, memory, research, and document queries.
+3. **Context retrieval:** The API loads recent conversation history and, when relevant, retrieves matching cross-conversation turns and structured research observations for the same user. Document retrieval supplies a bounded set of relevant excerpts from that user's completed uploads.
+4. **Agent orchestration:** The Vercel AI SDK streams Gemini responses. The model has exactly one callable tool, `webSearch`, backed by Tavily. Direct historical recall can be answered from retrieved history without web search; change-detection requests use the historical baseline and fresh search results when search is enabled.
+5. **Evidence capture:** Search hits remain available to application code with their URLs and dates. A separate application-side extraction call proposes structured observations; validation checks that each observation points to a returned URL and is supported by the supplied excerpt. New observations are appended rather than replacing earlier ones.
+6. **Document ingestion:** The browser uploads originals directly to a private Cloudflare R2 bucket using short-lived signed URLs. A local background worker claims queued jobs, reads the private object, extracts content, chunks it, generates Gemini embeddings, and writes chunks and processing metadata to LibSQL.
 
-| Table | Purpose and ownership |
+## 3. Components and responsibilities
+
+| Component | Responsibility |
 | --- | --- |
-| `conversations` | Conversation ID, `user_id`, creation time. |
-| `messages` | User and assistant turns linked to a conversation; ownership is enforced by joining through `conversations`. |
-| `local_users` | Local user-ID records referenced by durable memory rows. Clerk IDs are stored here as needed. |
-| `memory_items` | Durable cross-conversation memories, scoped by `user_id`, with source conversation reference and deduplication by owner, source conversation, and normalized summary. |
-| `research_sessions` | Research question, answer summary, retrieval time, conversation ID, and `user_id`. |
-| `entities` | Case-normalized entity identity shared across evidence rows; it has no owner column. |
-| `sources` | URL and first-seen title/publisher/publication metadata, plus latest retrieval time; it has no owner column. |
-| `observations` | Historical evidence value, entity/source/session links, observation/effective dates, and optional comparison dimensions. |
-| `documents` | Owner- and conversation-scoped file metadata, opaque storage key, processing status, retry count, and content/parser/embedding versions. |
-| `document_chunks` | Owner-scoped extracted chunks, page/heading metadata, hashes, and versioned embedding JSON. |
+| Next.js App Router | Chat UI, authenticated API routes, streaming, upload intents and downloads |
+| Clerk | User authentication and server-side owner identity |
+| Vercel AI SDK | Model orchestration, streaming, and the single callable tool |
+| Google Gemini | Answer generation, structured research extraction, embeddings, and image/OCR processing |
+| Tavily | External web search through `webSearch` |
+| LibSQL | Conversations, messages, user-scoped memory, research sessions, observations, document metadata, jobs, chunks, and embedding JSON |
+| Cloudflare R2 | Private storage for original uploaded files |
+| Document worker | Asynchronous extraction, chunking, embedding, retry, and indexing |
 
-`observations` preserves old rows: new research inserts a new observation rather than replacing a previous value. Comparison metadata is stored in nullable columns `plan_tier`, `currency`, `billing_interval`, `price_basis`, and `region`. Existing rows receive `NULL` for those fields, so they cannot support a confirmed price change under the comparison rules. Entity/source rows are shared and unowned; user isolation depends on first selecting owner-scoped research sessions and fetching observations only for those session IDs. The low-level observation/source helper functions do not independently require an owner parameter, so callers must retain that ordering constraint.
+## 4. Key design decisions
 
-## Cross-conversation memory
+### One model-callable tool
 
-Chat messages and durable memory are retrieved across conversations for the authenticated user. Message search uses bounded lexical matching over recent user-owned messages; date filters are applied to message timestamps. Topic and entity relevance filters exclude generic keyword-only matches, and uncertain matches are omitted. Direct recall selects up to two relevant user/assistant turns and bounded structured observations, then supplies them as private context to Gemini. Historical-comparison requests retrieve the matching conversation and observations separately, suppress unrelated durable-memory items, and pass a coverage matrix that marks requested attributes without structured baselines. The user receives a fresh answer rather than a transcript dump. This is not embedding-based semantic retrieval, and exact wording or short/ambiguous prompts can miss relevant history. Retrieved memory is supplied as context to Gemini; it is not itself a separate model tool.
+Only `webSearch` is exposed to the model. Historical memory and document retrieval are performed by authenticated application code before model generation. This keeps database access and ownership checks outside the model's tool surface and makes retrieval bounded and testable.
 
-Historical recall pairs a matching user turn with the next assistant turn in that conversation, excludes known fallback answers, and returns a bounded number of matches. Explicit dates and weekday references use the request's IANA time-zone value sent by the browser. If the field is missing or invalid, the route uses UTC. Database timestamps without an explicit offset are interpreted as UTC. Date queries are converted to local-day UTC start/end boundaries, then checked again against the requested local calendar date. An unqualified weekday resolves to its most recent occurrence (or the prior week when today has that weekday); `last` and `previous` resolve strictly before the current local date. This is browser time-zone behavior, not a saved account preference.
+### Historical memory is not current truth
 
-## Structured research retrieval and comparison
+Research sessions retain the question, summary, sources, and observation time. Observations preserve entity, attribute, value, source URL, and relevant dates; price observations can also store plan, currency, billing interval, price basis, and region. Historical-versus-current comparisons require comparable evidence. The result is `Changed`, `Unchanged`, or `Unable to verify`; absence of a search result is not proof that nothing changed.
 
-Successful Tavily search results are retained in application code while Gemini generates an answer. A separate structured extraction call receives bounded search snippets and can return up to twelve observations from up to ten hits. Each saved observation must point to an exact supplied URL and include a verbatim quote found in that hit. The application deterministically checks extracted numeric values, recognized currency, common price units, and supported explicit effective dates where possible. It rejects mismatched amounts, currencies, units, and unsupported dates. This validation cannot prove arbitrary natural-language claims, source authority, or that a search snippet is complete; non-numeric values must match the quoted text after normalization.
+### Relational persistence before specialized infrastructure
 
-Research retrieval is global across conversations for one authenticated owner. It scores at most fifty owner-scoped sessions using entity mentions, topic/summary token overlap, and date matches; the retrieval helper can return up to five sessions and eight observations per session. The chat route further bounds prompt context to three sessions and eighteen observations. Only selected owner-scoped session IDs are used to load observations. Historical facts include their observation time and source citation.
+LibSQL stores application state and serialized embeddings. Document similarity is computed in application code using cosine similarity and lexical overlap over a bounded candidate set. This avoids adding a separate vector database or queue service before scale requires one. Schema setup is additive and idempotent through `ensureSchema()`; it is not a versioned migration framework.
 
-For a historical-versus-current question, the route retrieves the user's matching historical conversation and structured research, supplies that baseline privately to Gemini, and leaves fresh lookup to the existing `webSearch` tool. It builds a coverage matrix for requested entity/attribute pairs so missing structured historical observations remain explicit; prior prose cannot silently fill those gaps. The generated answer should compare historical and current values and dates and use exactly these statuses: `Changed`, `Unchanged`, or `Unable to verify`. `Changed` requires comparable supported evidence from both periods. `Unchanged` requires current evidence that confirms the same value; a search that finds no change is not enough. Missing or mismatched evidence is `Unable to verify`.
+### Private object storage and asynchronous processing
 
-Price comparisons require matching entity and attribute plus non-empty matching plan tier, currency, billing interval, price basis, and region. The values must contain one parseable amount and use the same recognized currency. Non-price comparisons still rely on exact normalized entity/attribute matching and normalized value equality; arbitrary semantic equivalence is not inferred.
+Original files are stored in a private R2 bucket, not in database rows or public URLs. The server creates opaque object keys and short-lived presigned URLs. The worker processes queued jobs independently of the chat request, retries failed jobs up to three attempts, and records visible status. The current upload limit is 25 MiB; supported formats are PDF, DOCX, TXT, PNG, JPEG, and WebP.
 
-## Document retrieval
+### Retrieval is owner-scoped and bounded
 
-Uploads use authenticated upload intents and short-lived R2 presigned PUT URLs. The server generates opaque object keys, checks conversation ownership, verifies uploaded object size with HEAD, and changes the document to `queued`. The composer blocks sending while a selected file is uploading or processing; failed uploads must be retried or removed. Once sent, document references are stored with the user message and shown as attachment cards. Downloads use an owner-checked route that returns a short-lived signed URL. The bucket must remain private and be configured with the application origin in CORS.
+Conversation, memory, research-session, document, and chunk retrieval is filtered by the authenticated user. Relevant excerpts are bounded before they enter the model context. Document text and retrieved web content are treated as untrusted evidence, never as instructions.
 
-`bun run dev` starts the local document worker with Next.js; `bun run dev:web` starts only Next.js, and `bun run worker` starts the worker separately. The worker leases jobs, retries up to three times, marks processing failures visibly, extracts page-aware PDF text, DOCX headings/paragraphs/lists/tables, TXT blocks, or image text via Gemini vision, then creates structure-aware overlapping chunks and Gemini embeddings. Scanned PDF pages with little selectable text are rendered and passed through Gemini vision OCR. Retrieval runs before the model call across completed documents owned by the authenticated user, regardless of which chat they came from; the current chat's files are ranked first. It ranks at most 1,000 candidate chunks using cosine similarity and lexical overlap, then supplies at most six bounded excerpts with filename/page/section labels and an indication when a file came from another chat. Removing a file from the composer or deleting its source chat removes the stored object and indexed chunks, so it is no longer available in any chat. Document text is explicitly untrusted, and `webSearch` remains the sole model-callable tool.
+## 5. Data model
 
-## Time fields
+- `conversations` and `messages`: chat ownership and conversation turns.
+- `memory_items`: durable, user-scoped cross-conversation summaries.
+- `research_sessions`: saved research question, answer summary, owner, and research time.
+- `entities`, `sources`, and `observations`: normalized research entities, source metadata, and append-only historical facts. Observations are reached through owner-scoped research sessions.
+- `documents`: owner/conversation-scoped metadata, opaque R2 object key, status, retry count, and parser/embedding versions.
+- `document_chunks`: owner-scoped extracted content, page/section metadata, content hash, and serialized embedding.
 
-- `sources.published_at` is the publication date reported by Tavily when available.
-- `sources.retrieved_at` records the latest retrieval time for a URL.
-- `observations.observed_at` records when that value was captured and is preserved with the historical row.
-- `observations.valid_from` is set only when an effective date is explicitly supported by the evidence quote.
-- `research_sessions.researched_at` is the retrieval time represented by the session.
-- Conversation and message `created_at` values are LibSQL timestamp strings and are treated as UTC by historical recall.
+## 6. Local setup
 
-## Local database artifact
+The complete setup guide and environment-variable reference are in [README.md](./README.md). The short version:
 
-Runtime database files under `data/` are excluded from Git; only `.gitkeep` is tracked so the default `file:./data/minimi.db` path has a parent directory in a fresh checkout. The local database contains mixed development and user records and may include private conversations, so keep it on the developer's machine and use synthetic fixtures in tests. Existing database contents are preserved by the additive schema migration path.
+1. Install Bun and clone the repository.
+2. Run `bun install`.
+3. Copy `.env.example` to `.env.local`.
+4. Configure Google AI, Tavily, and Clerk keys. Configure private Cloudflare R2 credentials to enable document uploads.
+5. Run `bun run dev` and open [http://localhost:3000](http://localhost:3000).
 
-## Limitations
+`bun run dev` starts Next.js and the local document worker. Alternatively, `bun run dev:web` starts only the web application and `bun run worker` starts the worker in a separate terminal. The default database is `file:./data/minimi.db`; the schema is initialized additively on first use.
 
-- Vector retrieval currently scans at most 1,000 owner-scoped chunk rows and computes cosine similarity in application code. It does not depend on remote LibSQL vector indexes or add a vector database.
-- Memory and research matching are deterministic lexical/date retrieval, so paraphrases and ambiguous references can be missed.
-- Evidence validation checks only supplied search snippets and cannot independently verify all natural-language claims or source credibility.
-- Price comparisons are intentionally conservative; old observations or current sources missing any required comparison dimension yield `Unable to verify`.
-- `Unchanged` requires current evidence that explicitly confirms the historical value; failure to find a change is not confirmation.
-- CRM, historical recall, and Postgres-hosting regression scenarios use static fixtures. They test application behavior, not current vendor pricing or live announcements.
-- Legacy conversation claiming cannot determine the rightful owner of shared pre-auth data. Deployments should avoid importing ambiguous records across accounts.
-- The database uses additive inline schema setup, not a managed migration history. The write queue is process-local.
-- R2 upload, download, OCR/vision, and live embedding smoke checks require local credentials and a configured private bucket; these have not been run without those credentials.
+## 7. Known limitations and trade-offs
+
+- Memory and research matching use bounded lexical, entity, and date matching rather than embedding-based semantic memory; paraphrased or ambiguous references can be missed.
+- Document retrieval scans at most 1,000 candidate chunks and computes similarity in application code. A dedicated vector index may be justified only if measured scale or latency requires it.
+- Evidence validation can check source URL membership and excerpt support, plus selected numeric/date constraints, but cannot prove every natural-language claim or source authority.
+- Price comparisons are conservative: missing or mismatched plan, currency, billing interval, price basis, or region results in `Unable to verify`.
+- The local worker must be deployed as a separate long-running process in hosted environments.
+- The database uses additive inline schema setup rather than a versioned migration framework. The write queue is process-local and does not coordinate multiple server processes.
+- Fixture-based CRM, recall, and PostgreSQL tests verify application behavior, not live market facts. Live provider verification requires configured API credentials.
+- R2 upload/download, OCR, and embedding smoke tests require a configured private bucket and provider credentials.
