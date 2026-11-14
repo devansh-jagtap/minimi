@@ -5,8 +5,13 @@ import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 const authState = vi.hoisted(() => ({ userId: "memory-route-owner" }));
+const agentState = vi.hoisted(() => ({ run: vi.fn() }));
 vi.mock("@clerk/nextjs/server", () => ({ auth: async () => ({ userId: authState.userId }) }));
 vi.mock("next/server", () => ({ after: () => undefined }));
+vi.mock("@/agent/orchestrator", () => ({
+  INCOMPLETE_RESPONSE_NOTICE: "",
+  runResearchAgent: (messages: unknown, options: unknown) => agentState.run(messages, options),
+}));
 
 let database: typeof import("../src/lib/db");
 let post: typeof import("../src/app/api/chat/route").POST;
@@ -25,6 +30,18 @@ beforeAll(async () => {
   await database.saveMessage("route-postgres-chat", "assistant", "Findings: Neon offered the strongest branching workflow, Supabase combined Postgres with an integrated platform, and Railway was fastest to deploy. Recommendation: Neon for the production database.", authState.userId);
   await database.saveMessage("route-crm-chat", "user", "We compared HubSpot, Pipedrive, Zoho CRM, Freshsales, and Salesforce for CRM platforms for a 20-person sales team.", authState.userId);
   await database.saveMessage("route-crm-chat", "assistant", "Findings: HubSpot suited inbound sales, Pipedrive focused on sales pipelines, Zoho was budget oriented, Freshsales supported inside sales, and Salesforce fit advanced operations. Recommendation: Pipedrive for sales-focused teams.", authState.userId);
+  agentState.run.mockImplementation((_messages: unknown, rawOptions: unknown) => {
+    const options = rawOptions as { onFinish: (text: string, finishReason: "stop") => Promise<void> };
+    const generated = "Mock current CRM pricing research response.";
+    const finished = options.onFinish(generated, "stop");
+    const textStream = new ReadableStream<string>({
+      start(controller) {
+        controller.enqueue(generated);
+        controller.close();
+      },
+    });
+    return { textStream, finishReason: finished.then(() => "stop") };
+  });
   ({ POST: post } = await import("../src/app/api/chat/route"));
 });
 
@@ -90,5 +107,19 @@ describe("chat API historical recall end to end", () => {
     } finally {
       authState.userId = "memory-route-owner";
     }
+  });
+
+  it("routes a current CRM comparison to the research agent instead of the recall fallback", async () => {
+    const answer = await recall("I'm evaluating CRM platforms for a sales team of 20 people. Research these five options: HubSpot, Pipedrive, Zoho CRM, Freshsales, and Salesforce. Compare their current pricing, relevant plans, major features, and suitability for a 20-person sales team. Use current web sources, provide citations, and clearly distinguish verified information from estimates.");
+    expect(answer.status).toBe(200);
+    expect(answer.text).toBe("Mock current CRM pricing research response.");
+    expect(agentState.run).toHaveBeenCalled();
+    expect(agentState.run.mock.calls.at(-1)?.[1]).toMatchObject({ webSearchEnabled: true });
+  });
+
+  it("routes a new PostgreSQL comparison and save request to current research", async () => {
+    const answer = await recall("I'm planning to use PostgreSQL for a new application. Help me compare Neon, Supabase, and Railway as hosting providers. Focus on their free tiers, pricing models, database limits, connection pooling, and scalability. Save the key findings and recommendations from this research so we can revisit them later.");
+    expect(answer.text).toBe("Mock current CRM pricing research response.");
+    expect(agentState.run).toHaveBeenCalled();
   });
 });

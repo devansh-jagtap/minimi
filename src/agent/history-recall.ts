@@ -5,9 +5,12 @@ const MONTHS = ["january", "february", "march", "april", "may", "june", "july", 
 export type CalendarDate = { year: number; month: number; day: number };
 
 export function isHistoryRecallQuestion(query: string) {
-  return /\b(what|which|where|remind|recall|remember|discuss(?:ed|ion)?|asked|talked|compar(?:e|ed|ing))\b/i.test(query)
-    && /\b(ask(?:ed)?|discuss(?:ed|ion)?|talked|compar(?:e|ed|ing)|conversation|chat|question|history|remember)\b/i.test(query)
-    && /\b(on|about|from|last|previous|past|earlier|where)\b/i.test(query);
+  const directPastQuestion = /\b(?:what|which|where)\b.{0,80}\b(?:did|have|had)\s+(?:we|i)\b.{0,50}\b(?:ask|discuss|talk|compar|research|decid)\w*\b/i.test(query)
+    || /\bwhat\s+(?:we|i)\s+(?:asked|discussed|talked|compared|researched|decided)\b/i.test(query)
+    || /\bwhat\b.{0,40}\b(?:was i asking|question i asked)\b/i.test(query);
+  const explicitRecall = /\b(?:do you remember|can you recall|remember our|recall our)\b/i.test(query)
+    || /\b(?:previous|earlier|past|last time)\s+(?:conversation|chat|discussion|research)\b/i.test(query);
+  return directPastQuestion || explicitRecall;
 }
 
 export function historyRecallTopic(query: string) {
