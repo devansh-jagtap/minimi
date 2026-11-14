@@ -1,75 +1,138 @@
 # Minimi
 
-Minimi is a persistent web research assistant built with Next.js App Router, TypeScript, Bun, Vercel AI SDK, Google Gemini, Tavily, LibSQL, and Zod. It stores prior research as evidence-linked observations and can compare those observations with current search results.
+Minimi is a persistent, time-aware AI research assistant. It combines authenticated conversations, cross-chat memory, evidence-linked web research, historical-versus-current comparison, and private document retrieval.
 
-See the [system architecture diagram](./docs/architecture.md) for the chat, web research, memory, and document processing flows.
+## What it does
 
-## What Minimi does
+- **Research:** searches the web through Tavily and returns answers with source links. The model has exactly one callable tool: `webSearch`.
+- **Persistent memory:** saves conversations and structured research observations, then retrieves relevant information across the signed-in user's conversations.
+- **Time-aware comparison:** uses saved observations as the historical baseline, searches for current evidence, and labels each comparison `Changed`, `Unchanged`, or `Unable to verify`.
+- **Document RAG:** accepts PDF, DOCX, TXT, PNG, JPEG, and WebP files; extracts content, creates chunks and embeddings, and retrieves relevant excerpts across the same user's chats.
+- **Private file storage:** stores original uploads in a private Cloudflare R2 bucket. LibSQL stores metadata, processing state, chunks, and serialized embeddings.
 
-- Answers in a persistent, authenticated research workspace with conversation history and chat deletion.
-- Searches the web through Tavily when web search is enabled (on by default). The expandable research activity shows search queries, returned sources, and elapsed time; it does not expose private model reasoning.
-- Recalls relevant research across the signed-in user's conversations and writes a fresh summary instead of replaying the saved transcript.
-- For “what changed?” questions, uses saved observations as historical evidence, searches for current evidence, and reports `Changed`, `Unchanged`, or `Unable to verify` with citations.
-- Accepts private document uploads and retrieves relevant excerpts across chats belonging to the same user.
+## Architecture
 
-## Setup
+The request flow and component relationships are documented in [DESIGN.md](./DESIGN.md). The [architecture overview](./docs/architecture.md) includes a PNG diagram and a scalable SVG.
 
-1. Install [Bun](https://bun.sh/) if it is not already installed, then copy `.env.example` to `.env.local` in the project root.
-2. Add the required API keys to `.env.local`:
+At a high level:
 
-   ```dotenv
-   GOOGLE_GENERATIVE_AI_API_KEY=your-google-ai-api-key
-   TAVILY_API_KEY=your-tavily-api-key
-   NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
-   CLERK_SECRET_KEY=sk_test_...
-   ```
+1. The browser sends chat requests to the Next.js API.
+2. Clerk authenticates the request; the authenticated user ID scopes conversations, memory, research, and documents.
+3. The API retrieves relevant history and document excerpts before invoking Gemini through the Vercel AI SDK.
+4. When current information is needed, Gemini can call the single `webSearch` tool, which uses Tavily.
+5. Search evidence is retained by the application and eligible facts are extracted into append-only research observations.
+6. For uploads, the browser sends files directly to private R2 using short-lived signed URLs. A background worker extracts, chunks, embeds, and indexes the content in LibSQL.
 
-   Get Gemini and Tavily keys from their provider dashboards. Create or select a Clerk application, then copy its **development** Publishable Key and Secret Key from Clerk Dashboard → **API Keys**. The app requires both Clerk keys to serve the authenticated workspace. Keep all secret keys private; never commit `.env.local`.
-3. To enable document uploads, configure the Cloudflare R2 variables in `.env.local` using a private bucket and bucket-scoped S3 credentials. Chat, memory, and web research do not require R2. `DATABASE_URL` defaults to the local `data/minimi.db`; `GOOGLE_MODEL`, `GOOGLE_EMBEDDING_MODEL`, and upload settings have defaults in `.env.example`.
-4. Install dependencies and start Minimi:
+## Tech stack
 
-   ```sh
-   bun install
-   bun run dev
-   ```
+| Area | Technology |
+| --- | --- |
+| Web application | Next.js App Router, React, TypeScript |
+| Runtime / package manager | Bun |
+| Authentication | Clerk |
+| Model and embeddings | Google Gemini via Vercel AI SDK |
+| Web search | Tavily |
+| Application database | LibSQL |
+| Original document storage | Cloudflare R2 (S3-compatible API) |
+| Document extraction | PDF.js, Mammoth, Gemini vision/OCR |
+| Validation and tests | Zod, Vitest, ESLint |
 
-5. Open [http://localhost:3000](http://localhost:3000) and sign in or create an account. `bun run dev` starts both Next.js and the local document worker. To run only the web app, use `bun run dev:web`; start the worker separately with `bun run worker` if you need document processing.
+## Local setup
 
-The first account that signs in on a browser can import its saved pre-auth chats. Those chats are moved to that account's storage namespace and matching local database records are claimed once. Each account gets a separate conversation namespace and server-side owner scope.
+### Prerequisites
 
-Useful commands:
+- Bun installed.
+- A Google AI API key.
+- A Tavily API key for live web search.
+- A Clerk application with development keys.
+- A Cloudflare R2 bucket and S3 credentials only if you want to test document uploads.
 
-```sh
-bun run dev
-bun run test
-bun run lint
-bun run build
-bun run start
+### 1. Get the project and install dependencies
+
+```bash
+git clone https://github.com/devansh-jagtap/minimi.git
+cd minimi
+bun install
 ```
 
-## Document uploads
+### 2. Configure environment variables
 
-Copy the R2 variables from `.env.example` into the server's local environment and create a private R2 bucket plus a bucket-scoped S3 API token with object read/write access. Set bucket CORS to the exact Minimi app origin and permit `PUT` with `Content-Type`. Never commit or paste `R2_SECRET_ACCESS_KEY` into chat.
+Copy the example file:
 
-`bun run dev` starts both Next.js and the local document worker, so uploads begin processing automatically. The worker reads queued files from R2, extracts text, creates page/section-aware chunks and embeddings, and makes them searchable across chats for the owning user only. The upload limit is 25 MiB; supported types are PDF, DOCX, TXT, PNG, JPEG, and WebP. Remove a file from the composer before sending to delete it from storage and indexing. If you run `bun run dev:web` by itself, start the worker separately with `bun run worker`.
+PowerShell:
 
-Sending is blocked while selected files upload or process. Send the prompt after the files show as ready; Minimi stores the file references with that chat message, and the attachments appear in the conversation. A failed file must be retried or removed before sending. Deleting a conversation deletes its attached document objects and indexed chunks.
+```powershell
+Copy-Item .env.example .env.local
+```
 
-The production build uses Next.js webpack mode. The document worker is a separate local process; deploy it as a long-running worker alongside the web app when hosting document processing.
+macOS / Linux:
 
-## Memory lifecycle
+```bash
+cp .env.example .env.local
+```
 
-- Chat messages continue to be saved in `conversations` and `messages`.
-- Before answering, the app searches research sessions and conversation messages across the authenticated user's conversations, then filters the results by topic, entities, and explicit dates.
-- Direct memory recall is a no-web-search path; change-oriented recall keeps web search enabled when the user has enabled it.
-- The model has one callable tool, `webSearch`. Search hits are retained by application code with their URL, published date, and retrieval time.
-- A direct memory question passes a concise, relevant historical summary and structured observations to Gemini, which writes a new answer instead of replaying a saved transcript. A “has this changed?” question uses that history as a private baseline, runs fresh Tavily searches, and asks Gemini to compare the evidence.
-- After a response that used search, a bounded extraction call proposes structured facts. Zod validates the shape, and the app stores only facts whose URL is one of the returned hits and whose supporting excerpt occurs verbatim in that hit.
-- Observations are appended with their own observation time. Entity names and source URLs are deduplicated; historical values and source metadata remain available.
-- For historical comparisons, prior facts and citations are supplied as untrusted evidence. Gemini searches for current evidence and labels each requested comparison `Changed`, `Unchanged`, or `Unable to verify`. Missing or incomparable historical evidence is not filled in from model knowledge.
+Set the required values in `.env.local`:
 
-The schema is created additively and idempotently on first database use. Existing conversation data is left in place. See [DESIGN.md](./DESIGN.md) for the schema, matching rules, temporal fields, and limitations.
+| Variable | Required for | Description |
+| --- | --- | --- |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Chat, extraction, embeddings | Google AI API key |
+| `TAVILY_API_KEY` | Live web search | Tavily API key |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Authenticated workspace | Clerk development publishable key |
+| `CLERK_SECRET_KEY` | Authenticated workspace | Clerk secret key |
+| `DATABASE_URL` | Database | Defaults to `file:./data/minimi.db` |
+| `GOOGLE_MODEL` | Chat generation | Defaults to `gemini-2.5-flash` |
+| `GOOGLE_EMBEDDING_MODEL` | Document embeddings | Defaults to `gemini-embedding-001` |
+| `R2_ACCOUNT_ID` | Document uploads | Cloudflare account ID |
+| `R2_BUCKET_NAME` | Document uploads | Name of the private R2 bucket |
+| `R2_ACCESS_KEY_ID` | Document uploads | Bucket-scoped S3 access key ID |
+| `R2_SECRET_ACCESS_KEY` | Document uploads | Bucket-scoped S3 secret |
+| `R2_PRESIGN_TTL_SECONDS` | Signed upload URLs | Defaults to `300` seconds |
+| `MINIMI_DOCUMENT_MAX_BYTES` | Upload limit | Defaults to `26214400` (25 MiB) |
 
-## Tests
+Keep `.env.local` private. Never commit API keys, Clerk secrets, or R2 credentials.
 
-`bun run test` uses a temporary LibSQL database and deterministic fixtures. CRM shortlist, date recall, and Postgres-hosting cases test routing and retrieval behavior; they do not establish current vendor prices or product changes. Live research requires configured Google AI and Tavily credentials. Account-based chat and memory require configured Clerk keys. Document upload, download, OCR, and embedding checks also require configured R2 and Google credentials.
+### 3. Configure Cloudflare R2 (document uploads only)
+
+Create a **private** R2 bucket and a bucket-scoped S3 API token with object read/write access. Add the R2 variables to `.env.local`. Configure bucket CORS for the exact origin where Minimi runs and allow browser `PUT` requests with the `Content-Type` header.
+
+Chat, memory, and web research can be run without R2. Document uploads require the R2 configuration and Google credentials for extraction and embeddings.
+
+### 4. Start Minimi
+
+```bash
+bun run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000), then sign in or create an account.
+
+`bun run dev` starts the Next.js development server and the local document worker together. The database schema is initialized additively on first use.
+
+## Useful commands
+
+| Command | Purpose |
+| --- | --- |
+| `bun run dev` | Start web app and document worker |
+| `bun run dev:web` | Start only the Next.js web app |
+| `bun run worker` | Start the document worker separately |
+| `bun run test` | Run Vitest tests |
+| `bun run lint` | Run ESLint |
+| `bun run build` | Create the production build |
+| `bun run start` | Start the production web server |
+
+If you run `bun run dev:web` and need document processing, start `bun run worker` in a second terminal.
+
+## Document lifecycle
+
+The current upload limit is 25 MiB per file. Supported formats are PDF, DOCX, TXT, PNG, JPEG, and WebP. Uploads move through processing states; the composer prevents sending while selected files are still uploading or processing. The worker retries failed jobs up to three attempts. Completed files are available for same-owner retrieval across conversations. Removing a file or deleting its source conversation removes its stored object and indexed chunks.
+
+For hosted deployments, run the Next.js application and the document worker as separate processes. The worker must remain running to process queued uploads.
+
+## Memory and evidence behavior
+
+Direct memory recall uses relevant saved history and structured observations to write a new answer; it does not replay the old transcript. A change-detection question uses historical observations as a baseline and performs fresh web search when enabled. Historical facts are append-only and retain observation dates and source URLs. If historical or current evidence is missing or incomparable, Minimi should report `Unable to verify` rather than infer a change.
+
+## Tests and limitations
+
+`bun run test` uses deterministic fixtures for recall, CRM research routing, and PostgreSQL-hosting scenarios. Those tests validate application behavior; they do not verify live vendor prices or current product changes. Live model/search tests require Google AI and Tavily credentials. Authentication tests and workspace use require Clerk keys. Document upload, OCR, and embedding checks require R2 and Google credentials.
+
+See [DESIGN.md](./DESIGN.md) for architectural decisions, data ownership, retrieval behavior, security boundaries, and known limitations.
