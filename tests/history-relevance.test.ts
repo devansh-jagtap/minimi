@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { historyRecallTopic, isHistoryRecallQuestion, selectRecallTurns } from "../src/agent/history-recall";
+import { historyRecallTopic, isHistoricalComparisonQuestion, isHistoryRecallQuestion, selectRecallTurns } from "../src/agent/history-recall";
 
 const rows = [
   {
@@ -53,5 +53,10 @@ describe("cross-conversation recall relevance", () => {
   it("does not mistake ordinary current research prompts for historical recall", () => {
     expect(isHistoryRecallQuestion("I'm evaluating CRM platforms for a sales team of 20 people. Research these five options: HubSpot, Pipedrive, Zoho CRM, Freshsales, and Salesforce. Compare their current pricing, relevant plans, major features, and suitability. Use current web sources and distinguish verified information from estimates.")).toBe(false);
     expect(isHistoryRecallQuestion("I'm planning to use PostgreSQL for a new application. Help me compare Neon, Supabase, and Railway. Save key findings and recommendations from this research so we can revisit them later.")).toBe(false);
+    expect(isHistoryRecallQuestion("Last time we compared Neon, Supabase, and Railway for PostgreSQL hosting. Search the web again and tell me whether their pricing, free-tier limits, or major features have changed since our previous discussion. Compare the old findings with current sources. If you cannot verify a change, say so.")).toBe(false);
+    expect(isHistoricalComparisonQuestion("Last time we compared Neon, Supabase, and Railway for PostgreSQL hosting. Search the web again and tell me whether their pricing or limits changed since then.")).toBe(true);
+    expect(isHistoricalComparisonQuestion("Do you remember our previous Neon discussion? Is the free tier still accurate today?")).toBe(true);
+    expect(isHistoricalComparisonQuestion("Earlier we discussed Neon. Is that information still accurate?")).toBe(true);
+    expect(isHistoricalComparisonQuestion("What did we discuss earlier about PostgreSQL hosting?")).toBe(false);
   });
 });

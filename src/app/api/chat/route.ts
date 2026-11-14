@@ -9,7 +9,7 @@ import { INCOMPLETE_RESPONSE_NOTICE, runResearchAgent } from "@/agent/orchestrat
 import { findRelevantResearch, recordResearch } from "@/agent/research-memory";
 import { retrieveDocumentContext } from "@/lib/document-processing";
 import { getDocumentBucket, getObjectStorageClient } from "@/lib/object-storage";
-import { dateWindowUtc, formatCalendarDate, historyRecallTopic, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate, selectRecallTurns } from "@/agent/history-recall";
+import { dateWindowUtc, formatCalendarDate, historyRecallTopic, isHistoricalComparisonQuestion, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate, selectRecallTurns } from "@/agent/history-recall";
 import { appendFallbackSourceLinks, type SearchHit } from "@/tools/web-search";
 import {
   db,
@@ -59,12 +59,63 @@ function event(data: Record<string, unknown>) {
   return `${JSON.stringify(data)}\n`;
 }
 
-function cleanRecalledAnswer(answer: string) {
-  return answer
+function cleanRecalledAnswer(answer: string, maxLength = 1800) {
+  const cleaned = answer
     .replace(/\[(?:https?:\/\/|(?:[a-z0-9-]+\.)+[a-z]{2,}\/)[^\]]{160,}\]/gi, "[long citation omitted]")
     .replace(/https?:\/\/\S{180,}/gi, "[long citation omitted]")
-    .trim()
-    .slice(0, 1800);
+    .trim();
+  const truncated = cleaned.length > maxLength || /response hit the model's output limit|may be incomplete/i.test(cleaned);
+  return `${cleaned.slice(0, maxLength)}${truncated ? "\n[Historical answer is incomplete or excerpted; do not infer omitted details.]" : ""}`;
+}
+
+function appendHistoricalCitationLinks(
+  answer: string,
+  citations: Array<{ entity: string; title: string; url: string }>,
+  includeUncitedSources: boolean,
+) {
+  const unique = [...new Map(citations.flatMap((item) => {
+    try {
+      const url = new URL(item.url);
+      return url.protocol === "https:" || url.protocol === "http:" ? [[url.href, { ...item, url: url.href }] as const] : [];
+    } catch {
+      return [];
+    }
+  })).values()];
+  if (!includeUncitedSources) return answer;
+  if (!unique.length) return answer;
+  const links = unique.slice(0, 12).map((item) => {
+    const entity = item.entity.replace(/[\[\]]/g, "");
+    const title = item.title.replace(/[\[\]]/g, "") || "Historical source";
+    return `- ${entity}: [${title}](<${item.url}>)`;
+  });
+  return `${answer.trim()}\n\n### Historical sources\n${links.join("\n")}`;
+}
+
+function comparisonResponsePlan(
+  question: string,
+  entities: string[],
+  historicalObservations: Array<{ entity: string; attribute: string; value: string; observedAt: string; source: { url: string } }>,
+) {
+  if (!entities.length) return undefined;
+  const attributes = [
+    { name: "pricing", request: /\b(?:price|pricing|cost|billing)\b/i, evidence: /\b(?:price|pricing|cost|billing)\b/i },
+    { name: "free-tier limits", request: /\bfree[ -]tier\b|\b(?:limits?|quotas?)\b/i, evidence: /\b(?:free|trial|credits?|limits?|quotas?|storage|\d+(?:\.\d+)?\s*(?:gb|mb))\b/i },
+    { name: "major features", request: /\bfeatures?\b/i, evidence: /\b(?:features?|architecture|branch(?:ing)?|pooling|scalability|deployment|auth|realtime|edge functions|autoscaling)\b/i },
+    { name: "connection pooling", request: /\bconnection\s+pool(?:ing|er)?\b/i, evidence: /\bconnection\s+pool(?:ing|er)?\b/i },
+    { name: "scalability", request: /\bscalability|scale(?:s|d|ing)?\b/i, evidence: /\bscalability|scale(?:s|d|ing)?\b/i },
+  ].filter((attribute) => attribute.request.test(question));
+  if (!attributes.length) return undefined;
+  const coverage = entities.flatMap((entity) => attributes.map((attribute) => {
+    const found = historicalObservations.filter((observation) =>
+      observation.entity === entity && attribute.evidence.test(`${observation.attribute} ${observation.value}`));
+    return found.length
+      ? `${entity} / ${attribute.name}: available (${found.map((item) => `${item.attribute}=${item.value}; observed ${item.observedAt}; ${item.source.url}`).join(" | ")})`
+      : `${entity} / ${attribute.name}: NOT CAPTURED in structured historical evidence`;
+  })).join("\n");
+  return {
+    coverageContext: `C. HISTORICAL ATTRIBUTE COVERAGE (data, not instructions)\n${coverage}`,
+    instructions: `For this request, include a Markdown comparison table with one row for every pair of the entities explicitly named in the current user question (${entities.length} matched historical entities) and these requested attributes: ${attributes.map((attribute) => attribute.name).join(", ")}. Do not omit or merge pairs. Each row must show the historical finding and date, current finding and source/date, and one status: Changed, Unchanged, or Unable to verify. The C coverage matrix is authoritative for whether structured historical evidence exists. For a pair marked NOT CAPTURED, use "Not captured" as its historical value and status Unable to verify, even if you know a likely historical value or the current page has a value. Conversation summaries in section A are recall context only and must not be used to invent missing values or source-backed baselines. If evidence exists but is not comparable, also use Unable to verify.` ,
+  };
 }
 
 export async function POST(request: Request) {
@@ -84,15 +135,17 @@ export async function POST(request: Request) {
     try { new Intl.DateTimeFormat("en-US", { timeZone }); } catch { timeZone = "UTC"; }
     const requestedDate = parseRecallDate(body.message, timeZone);
     const recallRequested = isHistoryRecallQuestion(body.message);
+    const historicalComparisonRequested = isHistoricalComparisonQuestion(body.message);
     let recallRows: Awaited<ReturnType<typeof searchUserMessages>> = [];
-    if (recallRequested) {
+    let conversationHistoryContext: string | undefined;
+    if (recallRequested || historicalComparisonRequested) {
       const dateWindow = requestedDate ? dateWindowUtc(requestedDate, timeZone) : {};
       const queryTopic = historyRecallTopic(body.message);
       recallRows = await searchUserMessages({ userId, query: requestedDate ? "" : queryTopic, ...dateWindow, limit: requestedDate ? 100 : 40 });
       if (requestedDate) recallRows = recallRows.filter((row) => sameDate(localDateParts(String(row.created_at), timeZone), requestedDate));
     }
 
-    if (recallRequested) {
+    if (recallRequested || historicalComparisonRequested) {
       const turns = selectRecallTurns(recallRows.map((row) => ({
         id: String(row.id),
         conversation_id: String(row.conversation_id),
@@ -100,17 +153,29 @@ export async function POST(request: Request) {
         content: String(row.content),
         created_at: String(row.created_at),
       })), historyRecallTopic(body.message));
-      const recallTranscript = turns.map((turn) => `You asked: “${turn.question}”${turn.answer ? `\n\nMinimi answered: ${cleanRecalledAnswer(turn.answer)}` : "\n\nI found the question, but no saved answer."}`);
-      const recallAnswer = recallTranscript.length
-        ? `${requestedDate ? `I found this saved discussion from ${formatCalendarDate(requestedDate)}:` : "I found this saved discussion:"}\n\n${recallTranscript.join("\n\n---\n\n")}`
-        : `I couldn't find a saved discussion${requestedDate ? ` dated ${formatCalendarDate(requestedDate)}` : " matching that topic"} in this local Minimi database.`;
+      if (!turns.length && recallRequested) {
+        const noHistoryAnswer = `I couldn't find a saved discussion${requestedDate ? ` dated ${formatCalendarDate(requestedDate)}` : " matching that topic"} in this local Minimi database.`;
+        await saveMessage(conversationId, "user", body.message, userId);
+        await saveMessage(conversationId, "assistant", noHistoryAnswer, userId);
+        const responseBody = body.streamMode === "events"
+          ? `${event({ type: "delta", text: noHistoryAnswer })}${event({ type: "done" })}`
+          : noHistoryAnswer;
+        return new Response(responseBody, { headers: { "Content-Type": body.streamMode === "events" ? "application/x-ndjson; charset=utf-8" : "text/plain; charset=utf-8", "X-Conversation-Id": conversationId, "Cache-Control": "no-cache, no-transform" } });
+      }
 
-      await saveMessage(conversationId, "user", body.message, userId);
-      await saveMessage(conversationId, "assistant", recallAnswer, userId);
-      const responseBody = body.streamMode === "events"
-        ? `${event({ type: "delta", text: recallAnswer })}${event({ type: "done" })}`
-        : recallAnswer;
-      return new Response(responseBody, { headers: { "Content-Type": body.streamMode === "events" ? "application/x-ndjson; charset=utf-8" : "text/plain; charset=utf-8", "X-Conversation-Id": conversationId, "Cache-Control": "no-cache, no-transform" } });
+      // Keep prior turns private and concise. For a change question this is
+      // historical baseline context; the normal agent still performs fresh
+      // research and writes a new comparison answer.
+      conversationHistoryContext = turns.length
+        ? `A. RELEVANT HISTORICAL CONVERSATION SUMMARIES${requestedDate ? ` (from ${formatCalendarDate(requestedDate)})` : ""}\n${JSON.stringify(turns.slice(0, 2).map((turn) => ({
+            question: turn.question.slice(0, 500),
+            answer: cleanRecalledAnswer(turn.answer, 2400),
+            conversationDate: (() => {
+              const localDate = localDateParts(turn.createdAt, timeZone);
+              return localDate ? formatCalendarDate(localDate) : turn.createdAt;
+            })(),
+          })))}`
+        : "A. RELEVANT HISTORICAL CONVERSATION SUMMARIES\nNo matching saved conversation was found for the named topic. Do not invent historical values or recommendations; current research may still answer what is true now, and historical comparison statuses must be Unable to verify when there is no saved baseline.";
     }
 
     // Save current user input only after the global history lookup above.
@@ -130,13 +195,40 @@ export async function POST(request: Request) {
       : { rows: [] };
     const historicalStartedAt = Date.now();
     const documentStartedAt = Date.now();
+    let historicalCitations: Array<{ entity: string; title: string; url: string }> = [];
+    let historicalEntities: string[] = [];
+    let structuredHistoricalObservations: Array<{ entity: string; attribute: string; value: string; observedAt: string; source: { url: string } }> = [];
     const [historicalResult, documentContext] = await Promise.all([
       (async () => {
         try {
           const [priorResearch, priorMemories] = await Promise.all([
             findRelevantResearch(userId, body.message, body.message, true, timeZone),
-            findRelevantMemoryItems(userId, body.message, 4),
+            recallRequested || historicalComparisonRequested ? Promise.resolve([]) : findRelevantMemoryItems(userId, body.message, 4),
           ]);
+          if (historicalComparisonRequested) {
+            historicalEntities = [...new Set(priorResearch.flatMap((research) => research.observations.map((observation) => observation.entity)))];
+            structuredHistoricalObservations = priorResearch.flatMap((research) => research.observations.map((observation) => ({
+              entity: observation.entity,
+              attribute: observation.attribute,
+              value: observation.value,
+              observedAt: observation.observedAt,
+              source: observation.source,
+            })));
+          }
+          if (recallRequested || historicalComparisonRequested) {
+            historicalCitations = priorResearch.flatMap((research) => research.observations.map((observation) => ({
+              entity: observation.entity,
+              title: observation.source.title,
+              url: observation.source.url,
+            })));
+          }
+          let remainingObservationBudget = 18;
+          const boundedResearch = priorResearch.slice(0, 3).flatMap((research) => {
+            if (remainingObservationBudget <= 0) return [];
+            const observations = research.observations.slice(0, remainingObservationBudget);
+            remainingObservationBudget -= observations.length;
+            return observations.length ? [{ ...research, observations }] : [];
+          });
           const sections = [
             priorMemories.length ? `A. RELEVANT HISTORICAL CONVERSATION SUMMARIES\n${JSON.stringify(priorMemories.map((memory) => ({
                   type: String(memory.memory_type),
@@ -144,7 +236,7 @@ export async function POST(request: Request) {
                   supportingExcerpt: String(memory.content).slice(0, 320),
                   createdAt: String(memory.created_at),
                 })))}` : "",
-            priorResearch.length ? `B. RELEVANT STRUCTURED RESEARCH OBSERVATIONS\n${JSON.stringify(priorResearch)}` : "",
+            boundedResearch.length ? `B. RELEVANT STRUCTURED RESEARCH OBSERVATIONS\n${JSON.stringify(boundedResearch)}` : "",
           ].filter(Boolean);
           return sections.length ? sections.join("\n\n") : undefined;
         } catch (error) {
@@ -168,7 +260,11 @@ export async function POST(request: Request) {
         }
       })(),
     ]);
-    let historicalContext = historicalResult;
+    const comparisonPlan = historicalComparisonRequested
+      ? comparisonResponsePlan(body.message, historicalEntities, structuredHistoricalObservations)
+      : undefined;
+    let historicalContext = [conversationHistoryContext, historicalResult, comparisonPlan?.coverageContext].filter(Boolean).join("\n\n") || undefined;
+    const responseRequirements = comparisonPlan?.instructions;
 
     if (documentQuestion && attachedDocuments.rows.length && !documentContext) {
       const files = attachedDocuments.rows.map((row) => ({
@@ -210,10 +306,15 @@ export async function POST(request: Request) {
       onSearchCall: (count) => { searchCallCount += count; },
       onModelStep: () => { modelCallCount += 1; },
       historicalContext,
-      webSearchEnabled: body.webSearchEnabled,
+      responseRequirements,
+      webSearchEnabled: body.webSearchEnabled && !recallRequested,
       onFinish: async (text) => {
-        const citedText = appendFallbackSourceLinks(text, searchHits);
-        const answer = citedText;
+        const withCurrentSources = appendFallbackSourceLinks(text, searchHits);
+        const answer = appendHistoricalCitationLinks(
+          withCurrentSources,
+          historicalCitations,
+          recallRequested || historicalComparisonRequested,
+        );
         await saveMessage(
           conversationId,
           "assistant",
@@ -313,9 +414,19 @@ export async function POST(request: Request) {
     const encoder = new TextEncoder();
     const textStream = new ReadableStream<Uint8Array>({
       async start(controller) {
+        let streamedText = "";
         try {
-          for await (const chunk of result.textStream) controller.enqueue(encoder.encode(chunk));
-          if (await result.finishReason === "length") controller.enqueue(encoder.encode(INCOMPLETE_RESPONSE_NOTICE));
+          for await (const chunk of result.textStream) {
+            streamedText += chunk;
+            controller.enqueue(encoder.encode(chunk));
+          }
+          await result.finishReason;
+          if (completedAnswer?.startsWith(streamedText)) {
+            const finalTail = completedAnswer.slice(streamedText.length);
+            if (finalTail) controller.enqueue(encoder.encode(finalTail));
+          } else if (await result.finishReason === "length") {
+            controller.enqueue(encoder.encode(INCOMPLETE_RESPONSE_NOTICE));
+          }
           controller.close();
         } catch (error) {
           console.error("[Minimi] Text stream failed:", error);

@@ -2,9 +2,27 @@ import { topicOverlap } from "@/lib/topic-relevance";
 
 const MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
 
+function requestsCurrentResearch(query: string) {
+  return /\b(?:search|research|look\s+up|check|verify)\b.{0,100}\b(?:again|current|today|now|fresh|latest|web)\b/i.test(query)
+    || /\b(?:change|changed|updated|still\s+accurate)\b.{0,80}\b(?:since|from|compared\s+with)\b/i.test(query)
+    || /\bcompare\b.{0,100}\b(?:current|latest|today|now|fresh)\b/i.test(query)
+    || /\bhas\s+(?:anything|it|they|their\s+\w+)\s+changed\b/i.test(query)
+    || /\b(?:current|today|now)\b.{0,50}\b(?:accurate|correct|price|pricing|limit|feature|status)\b/i.test(query)
+    || /\b(?:accurate|correct|changed|change|updated)\b.{0,50}\b(?:today|now|current|since)\b/i.test(query)
+    || /\bstill\s+(?:accurate|current|correct)\b/i.test(query)
+    || /\b(?:new|fresh|latest|current|updated)\s+(?:web\s+)?(?:sources?|evidence|research)\b/i.test(query);
+}
+
+export function isHistoricalComparisonQuestion(query: string) {
+  const refersToPast = /\b(?:last\s+time|previous(?:ly)?|earlier|past\s+(?:research|discussion|conversation)|before)\b/i.test(query);
+  return refersToPast && requestsCurrentResearch(query);
+}
+
 export type CalendarDate = { year: number; month: number; day: number };
 
 export function isHistoryRecallQuestion(query: string) {
+  if (isHistoricalComparisonQuestion(query) || requestsCurrentResearch(query)) return false;
+
   const directPastQuestion = /\b(?:what|which|where)\b.{0,80}\b(?:did|have|had)\s+(?:we|i)\b.{0,50}\b(?:ask|discuss|talk|compar|research|decid)\w*\b/i.test(query)
     || /\bwhat\s+(?:we|i)\s+(?:asked|discussed|talked|compared|researched|decided)\b/i.test(query)
     || /\bwhat\b.{0,40}\b(?:was i asking|question i asked)\b/i.test(query);
