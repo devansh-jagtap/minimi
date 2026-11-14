@@ -4,6 +4,14 @@ Minimi is a persistent web research assistant built with Next.js App Router, Typ
 
 See the [system architecture diagram](./docs/architecture.md) for the chat, web research, memory, and document processing flows.
 
+## What Minimi does
+
+- Answers in a persistent, authenticated research workspace with conversation history and chat deletion.
+- Searches the web through Tavily when web search is enabled (on by default). The expandable research activity shows search queries, returned sources, and elapsed time; it does not expose private model reasoning.
+- Recalls relevant research across the signed-in user's conversations and writes a fresh summary instead of replaying the saved transcript.
+- For “what changed?” questions, uses saved observations as historical evidence, searches for current evidence, and reports `Changed`, `Unchanged`, or `Unable to verify` with citations.
+- Accepts private document uploads and retrieves relevant excerpts across chats belonging to the same user.
+
 ## Setup
 
 1. Copy `.env.example` to `.env.local` and provide your Google AI and Tavily keys.
@@ -36,12 +44,15 @@ Copy the R2 variables from `.env.example` into the server's local environment an
 
 `bun run dev` starts both Next.js and the local document worker, so uploads begin processing automatically. The worker reads queued files from R2, extracts text, creates page/section-aware chunks and embeddings, and makes them searchable across chats for the owning user only. The upload limit is 25 MiB; supported types are PDF, DOCX, TXT, PNG, JPEG, and WebP. Remove a file from the composer before sending to delete it from storage and indexing. If you run `bun run dev:web` by itself, start the worker separately with `bun run worker`.
 
+Sending is blocked while selected files upload or process. Send the prompt after the files show as ready; Minimi stores the file references with that chat message, and the attachments appear in the conversation. A failed file must be retried or removed before sending. Deleting a conversation deletes its attached document objects and indexed chunks.
+
 The production build uses Next.js webpack mode. The document worker is a separate local process; deploy it as a long-running worker alongside the web app when hosting document processing.
 
 ## Memory lifecycle
 
 - Chat messages continue to be saved in `conversations` and `messages`.
 - Before answering, the app searches research sessions and conversation messages across the authenticated user's conversations, then filters the results by topic, entities, and explicit dates.
+- Direct memory recall is a no-web-search path; change-oriented recall keeps web search enabled when the user has enabled it.
 - The model has one callable tool, `webSearch`. Search hits are retained by application code with their URL, published date, and retrieval time.
 - A direct memory question passes a concise, relevant historical summary and structured observations to Gemini, which writes a new answer instead of replaying a saved transcript. A “has this changed?” question uses that history as a private baseline, runs fresh Tavily searches, and asks Gemini to compare the evidence.
 - After a response that used search, a bounded extraction call proposes structured facts. Zod validates the shape, and the app stores only facts whose URL is one of the returned hits and whose supporting excerpt occurs verbatim in that hit.
@@ -52,4 +63,4 @@ The schema is created additively and idempotently on first database use. Existin
 
 ## Tests
 
-`bun run test` uses a temporary LibSQL database and deterministic fixtures. CRM shortlist, date recall, and Postgres-hosting cases are fixtures; they do not claim that current vendor prices or product changes were checked live. Live research requires configured Google AI and Tavily credentials. Account-based chat and memory require configured Clerk keys.
+`bun run test` uses a temporary LibSQL database and deterministic fixtures. CRM shortlist, date recall, and Postgres-hosting cases test routing and retrieval behavior; they do not establish current vendor prices or product changes. Live research requires configured Google AI and Tavily credentials. Account-based chat and memory require configured Clerk keys. Document upload, download, OCR, and embedding checks also require configured R2 and Google credentials.
