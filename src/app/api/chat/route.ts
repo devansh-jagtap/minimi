@@ -5,12 +5,12 @@ import { auth } from "@clerk/nextjs/server";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { after } from "next/server";
 
-import { runResearchAgent } from "@/agent/orchestrator";
+import { INCOMPLETE_RESPONSE_NOTICE, runResearchAgent } from "@/agent/orchestrator";
 import { findRelevantResearch, recordResearch } from "@/agent/research-memory";
 import { retrieveDocumentContext } from "@/lib/document-processing";
 import { getDocumentBucket, getObjectStorageClient } from "@/lib/object-storage";
 import { dateWindowUtc, formatCalendarDate, historyRecallTopic, isHistoryRecallQuestion, localDateParts, parseRecallDate, sameDate, selectRecallTurns } from "@/agent/history-recall";
-import type { SearchHit } from "@/tools/web-search";
+import { appendFallbackSourceLinks, type SearchHit } from "@/tools/web-search";
 import {
   db,
   ensureSchema,
@@ -121,11 +121,6 @@ export async function POST(request: Request) {
       content: String(row.content),
     }));
 
-    const retrievalQuery = messages
-      .filter((message) => message.role === "user")
-      .slice(-8)
-      .map((message) => message.content)
-      .join("\n");
     const documentQuestion = /\b(file|document|attachment|pdf|resume|spreadsheet)\b/i.test(body.message);
     const attachedDocuments = documentQuestion
       ? await db.execute({
@@ -138,10 +133,8 @@ export async function POST(request: Request) {
     const [historicalResult, documentContext] = await Promise.all([
       (async () => {
         try {
-          const [priorResearch, priorMemories] = await Promise.all([
-            findRelevantResearch(userId, retrievalQuery, body.message, true, timeZone),
-            findRelevantMemoryItems(userId, body.message, 4),
-          ]);
+          const priorResearch = await findRelevantResearch(userId, body.message, body.message, true, timeZone);
+          const priorMemories = priorResearch.length ? [] : await findRelevantMemoryItems(userId, body.message, 4);
           return priorResearch.length || priorMemories.length
             ? JSON.stringify({
                 storedEvidence: priorResearch,
@@ -218,10 +211,12 @@ export async function POST(request: Request) {
       historicalContext,
       webSearchEnabled: body.webSearchEnabled,
       onFinish: async (text) => {
+        const citedText = appendFallbackSourceLinks(text, searchHits);
+        const answer = citedText;
         await saveMessage(
           conversationId,
           "assistant",
-          text,
+          answer,
           userId,
         );
         try {
@@ -233,13 +228,13 @@ export async function POST(request: Request) {
               userId,
               conversationId,
               memoryType,
-              content: `User asked: ${body.message}\nAssistant answered: ${text.slice(0, 12000)}`,
+              content: `User asked: ${body.message}\nAssistant answered: ${answer.slice(0, 12000)}`,
               summary: body.message.slice(0, 500),
             });
         } catch (error) {
           console.error("[Minimi] Global memory save failed:", error);
         }
-        completedAnswer = text;
+        completedAnswer = answer;
         console.info(`[Minimi] Answer ready in ${Date.now() - requestStartedAt}ms; chat model steps ${modelCallCount}; Tavily queries ${searchCallCount}`);
       },
     });
@@ -268,6 +263,7 @@ export async function POST(request: Request) {
         start(controller) {
           const encoder = new TextEncoder();
           const write = (data: Record<string, unknown>) => controller.enqueue(encoder.encode(event(data)));
+          let streamedText = "";
           void (async () => {
             try {
               for await (const part of result.fullStream) {
@@ -277,10 +273,20 @@ export async function POST(request: Request) {
                 } else if (part.type === "tool-result" && part.toolName === "webSearch") {
                   write({ type: "search-results", results: part.output });
                 } else if (part.type === "text-delta") {
+                  streamedText += part.text;
                   write({ type: "delta", text: part.text });
+                } else if (part.type === "finish" && part.finishReason === "length") {
+                  streamedText += INCOMPLETE_RESPONSE_NOTICE;
+                  write({ type: "delta", text: INCOMPLETE_RESPONSE_NOTICE });
                 } else if (part.type === "error") {
                   write({ type: "error", message: "The assistant hit a generation error." });
                 }
+              }
+              // Citation fallback is added after generation so it reaches the
+              // live answer as well as the saved conversation.
+              if (completedAnswer?.startsWith(streamedText)) {
+                const citationTail = completedAnswer.slice(streamedText.length);
+                if (citationTail) write({ type: "delta", text: citationTail });
               }
               write({ type: "done" });
               controller.close();
@@ -302,9 +308,24 @@ export async function POST(request: Request) {
       });
     }
 
-    // Keep the SDK's plain text stream as the default for existing callers.
-    return result.toTextStreamResponse({
+    // Preserve plain-text compatibility and surface output-limit truncation.
+    const encoder = new TextEncoder();
+    const textStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          for await (const chunk of result.textStream) controller.enqueue(encoder.encode(chunk));
+          if (await result.finishReason === "length") controller.enqueue(encoder.encode(INCOMPLETE_RESPONSE_NOTICE));
+          controller.close();
+        } catch (error) {
+          console.error("[Minimi] Text stream failed:", error);
+          controller.enqueue(encoder.encode("\n\nMinimi couldn't complete this response. Please retry."));
+          controller.close();
+        }
+      },
+    });
+    return new Response(textStream, {
       headers: {
+        "Content-Type": "text/plain; charset=utf-8",
         "X-Conversation-Id": conversationId,
         "Cache-Control": "no-cache, no-transform",
       },

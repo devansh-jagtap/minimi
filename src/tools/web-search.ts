@@ -67,6 +67,34 @@ type SearchHit = {
   retrievedAt: string;
 };
 
+export function appendFallbackSourceLinks(answer: string, hits: SearchHit[]) {
+  const supportedUrls = new Set(hits.map((hit) => hit.url));
+  const sanitizedAnswer = answer.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/gi, (markdown, label: string, url: string) =>
+    supportedUrls.has(url) ? markdown : label,
+  );
+  if (/\[[^\]]+\]\(https?:\/\/[^)]+\)/i.test(sanitizedAnswer)) return sanitizedAnswer;
+  const bestByQuery = new Map<string, SearchHit>();
+  for (const hit of hits) {
+    try {
+      const url = new URL(hit.url);
+      if (url.protocol !== "https:" && url.protocol !== "http:") continue;
+    } catch {
+      continue;
+    }
+    const current = bestByQuery.get(hit.searchQuery);
+    if (!current || (hit.score ?? 0) > (current.score ?? 0)) bestByQuery.set(hit.searchQuery, hit);
+  }
+  const sources = [...bestByQuery.values()].slice(0, 8);
+  if (!sources.length) return sanitizedAnswer;
+  const links = sources.map((hit) => {
+    const title = hit.title.replace(/[\[\]]/g, "").slice(0, 140) || new URL(hit.url).hostname;
+    const published = hit.publishedDate ? ` · published ${hit.publishedDate.slice(0, 10)}` : "";
+    const checked = hit.retrievedAt ? ` · checked ${hit.retrievedAt.slice(0, 10)}` : "";
+    return `- [${title}](${hit.url})${published}${checked}`;
+  });
+  return `${sanitizedAnswer.trim()}\n\n### Sources\n${links.join("\n")}`;
+}
+
 type SearchFailure = {
   searchQuery: string;
   error: string;

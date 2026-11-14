@@ -1,9 +1,11 @@
 
-import { streamText, isStepCount } from "ai";
+import { streamText, isStepCount, type FinishReason } from "ai";
 
 import { model } from "@/lib/ai";
 import { createWebSearchTool, type SearchHit } from "@/tools/web-search";
 import { SYSTEM_PROMPT } from "./system-prompt";
+
+export const INCOMPLETE_RESPONSE_NOTICE = "\n\n> This response hit the model's output limit and may be incomplete. Ask me to continue for the remaining details.";
 
 export function runResearchAgent(
   messages: Array<{
@@ -17,7 +19,7 @@ export function runResearchAgent(
     onModelStep?: () => void;
     historicalContext?: string;
     webSearchEnabled?: boolean;
-    onFinish?: (text: string) => Promise<void>;
+    onFinish?: (text: string, finishReason: FinishReason) => Promise<void>;
   }
 ) {
   return streamText({
@@ -28,7 +30,7 @@ export function runResearchAgent(
 
     stopWhen: isStepCount(4),
     maxRetries: 1,
-    maxOutputTokens: 1500,
+    maxOutputTokens: 2800,
     temperature: 0.2,
     onError: ({ error }) => {
   console.error("[Minimi] Generation error:", error);
@@ -43,8 +45,9 @@ export function runResearchAgent(
       stepMs: 20000,
     },
 
-    onFinish: async ({ text }) => {
-      await options?.onFinish?.(text);
+    onFinish: async ({ text, finishReason }) => {
+      const finalText = finishReason === "length" ? `${text}${INCOMPLETE_RESPONSE_NOTICE}` : text;
+      await options?.onFinish?.(finalText, finishReason);
     },
   });
 }

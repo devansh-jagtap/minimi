@@ -204,6 +204,18 @@ describe("structured research persistence", () => {
       },
     ]), oldDate);
 
+    const unrelatedCrmSession = await memory.saveResearchSession({
+      conversationId: "unrelated-crm-history-chat",
+      userId: LOCAL_USER_ID,
+      topic: "Shortlist CRM pricing and features for a sales team",
+      summary: "Unrelated saved CRM comparison.",
+      researchedAt: "2026-11-10T10:00:00.000Z",
+    });
+    await memory.saveObservations(unrelatedCrmSession.id, [
+      { entity: { name: "HubSpot", type: "company" }, source: { url: "https://history.example/hubspot-crm", title: "CRM pricing" }, attribute: "Pro plan price", value: "$20/user/month" },
+      { entity: { name: "Salesforce", type: "company" }, source: { url: "https://history.example/salesforce-crm", title: "CRM pricing" }, attribute: "Pro plan price", value: "$25/user/month" },
+    ], unrelatedCrmSession.researchedAt);
+
     // Put the target beyond the recent-session window to verify entity-targeted lookup.
     for (let index = 0; index < 55; index += 1) {
       await memory.saveResearchSession({
@@ -217,11 +229,14 @@ describe("structured research persistence", () => {
 
     const { findRelevantResearch, filterSupportedObservations, classifyObservationComparison } = await import("../src/agent/research-memory");
     const query = "Last time we compared Neon, Supabase, and Railway for PostgreSQL hosting. Has their pricing, free-tier limits, or major features changed since?";
-    const history = await findRelevantResearch(LOCAL_USER_ID, query, query, true);
+    const broadRecentHistory = `${query}\nI also shortlisted HubSpot, Pipedrive, Zoho CRM, Freshsales, and Salesforce for a sales team.`;
+    const history = await findRelevantResearch(LOCAL_USER_ID, broadRecentHistory, query, true);
     const historical = history.find((item) => item.session.topic.includes("Compare Neon Supabase Railway"));
     expect(historical?.session.researchedAt).toBe(oldDate);
     expect(historical?.session).not.toHaveProperty("summary");
     expect(historical?.observations).toHaveLength(9);
+    expect(history.flatMap((item) => item.observations).map((item) => item.entity)).not.toContain("Salesforce");
+    expect(history.flatMap((item) => item.observations).map((item) => item.entity)).not.toContain("HubSpot");
 
     vi.stubEnv("TAVILY_API_KEY", "test-only-not-a-real-key");
     vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -371,8 +386,8 @@ describe("structured research persistence", () => {
     });
 
     const { findRelevantResearch } = await import("../src/agent/research-memory");
-    const ownerHistory = await findRelevantResearch(LOCAL_USER_ID, "GlobalNeonTest price", "today", true);
-    const otherHistory = await findRelevantResearch("research-isolated-user", "GlobalNeonTest private price", "today", true);
+    const ownerHistory = await findRelevantResearch(LOCAL_USER_ID, "GlobalNeonTest price", "GlobalNeonTest price", true);
+    const otherHistory = await findRelevantResearch("research-isolated-user", "GlobalNeonTest private price", "GlobalNeonTest private price", true);
     expect(ownerHistory.flatMap((session) => session.observations).map((item) => item.value)).toContain("$19");
     expect(otherHistory.flatMap((session) => session.observations).map((item) => item.value)).not.toContain("$19");
   });

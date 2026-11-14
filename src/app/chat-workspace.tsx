@@ -184,7 +184,7 @@ function MessageAttachment({ filename }: { filename: string }) {
 function SearchActivityView({ activity, phase, now }: { activity: SearchActivity[]; phase?: string; now: number }) {
   if (!activity.length && !phase) return null;
   const sourceCount = activity.reduce((count, item) => count + item.sources.length, 0);
-  return <details className="search-activity" open>
+  return <details className="search-activity">
     <summary><span className="activity-pulse" />{phase ?? "Research activity"}<span className="activity-count">{activity.length} {activity.length === 1 ? "search" : "searches"}{sourceCount ? ` · ${sourceCount} sources` : ""}</span></summary>
     <div className="activity-list">{activity.map((item) => <section key={item.id} className="activity-query">
       <div className="activity-query-title"><span className={`activity-state activity-state-${item.status}`} />{item.status === "searching" ? "Searching" : item.status === "failed" ? "Search unavailable" : "Searched"}: {item.query}<span className="activity-duration">{((item.durationMs ?? Math.max(0, now - (item.startedAt || now))) / 1000).toFixed(1)}s</span></div>
@@ -481,7 +481,13 @@ export default function ChatWorkspace({ userId }: { userId: string }) {
           updateActivity((activity) => activity.map((entry) => {
             const matching = results.filter((result) => result.searchQuery === entry.query);
             if (!matching.length) return entry;
-            return { ...entry, status: matching.some((result) => result.url) ? "complete" : "failed", durationMs: Date.now() - entry.startedAt, sources: matching.flatMap((result) => result.url ? [{ title: result.title ?? result.url, url: result.url }] : []) };
+            const seenUrls = new Set<string>();
+            const sources = matching.flatMap((result) => {
+              if (!result.url || seenUrls.has(result.url)) return [];
+              seenUrls.add(result.url);
+              return [{ title: result.title ?? result.url, url: result.url }];
+            }).slice(0, 2);
+            return { ...entry, status: sources.length ? "complete" : "failed", durationMs: Date.now() - entry.startedAt, sources };
           }), "Reviewing sources");
         } else if (item.type === "done") {
           setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, phase: undefined } : message));
