@@ -14,17 +14,26 @@ See the [system architecture diagram](./docs/architecture.md) for the chat, web 
 
 ## Setup
 
-1. Copy `.env.example` to `.env.local` and provide your Google AI and Tavily keys.
-2. Open the selected Clerk application (`app_3M1cyqyRyVegjHarhz8IBomUHvO`) in the Clerk Dashboard and go to **API Keys**. Copy its development Publishable Key and Secret Key into `.env.local`:
+1. Install [Bun](https://bun.sh/) if it is not already installed, then copy `.env.example` to `.env.local` in the project root.
+2. Add the required API keys to `.env.local`:
 
-   ```env
+   ```dotenv
+   GOOGLE_GENERATIVE_AI_API_KEY=your-google-ai-api-key
+   TAVILY_API_KEY=your-tavily-api-key
    NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
    CLERK_SECRET_KEY=sk_test_...
    ```
 
-   Keep `CLERK_SECRET_KEY` private and out of Git. The app requires both keys before it serves the workspace. On this Windows setup, the Clerk CLI binary is blocked by Application Control, so use the Dashboard instead of `bunx clerk`.
-3. Install dependencies with `bun install`.
-4. Start the app with `bun run dev` and open [http://localhost:3000](http://localhost:3000). Sign in or create an account to use Minimi.
+   Get Gemini and Tavily keys from their provider dashboards. Create or select a Clerk application, then copy its **development** Publishable Key and Secret Key from Clerk Dashboard → **API Keys**. The app requires both Clerk keys to serve the authenticated workspace. Keep all secret keys private; never commit `.env.local`.
+3. To enable document uploads, configure the Cloudflare R2 variables in `.env.local` using a private bucket and bucket-scoped S3 credentials. Chat, memory, and web research do not require R2. `DATABASE_URL` defaults to the local `data/minimi.db`; `GOOGLE_MODEL`, `GOOGLE_EMBEDDING_MODEL`, and upload settings have defaults in `.env.example`.
+4. Install dependencies and start Minimi:
+
+   ```sh
+   bun install
+   bun run dev
+   ```
+
+5. Open [http://localhost:3000](http://localhost:3000) and sign in or create an account. `bun run dev` starts both Next.js and the local document worker. To run only the web app, use `bun run dev:web`; start the worker separately with `bun run worker` if you need document processing.
 
 The first account that signs in on a browser can import its saved pre-auth chats. Those chats are moved to that account's storage namespace and matching local database records are claimed once. Each account gets a separate conversation namespace and server-side owner scope.
 
