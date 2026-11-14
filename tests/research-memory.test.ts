@@ -155,18 +155,135 @@ describe("structured research persistence", () => {
       source: { url: `https://fixture.example/${encodeURIComponent(name)}`, title: `${name} pricing fixture`, publisher: "fixture.example" },
       attribute: "Entry plan price per user per month",
       value: price,
+      comparison: { planTier: "Starter", currency: "USD", billingInterval: "monthly", priceBasis: "per user", region: "US" },
     })), session.researchedAt);
 
     const { findRelevantResearch, classifyObservationComparison } = await import("../src/agent/research-memory");
     const result = await findRelevantResearch("crm-fixture", "Has HubSpot, Salesforce, Pipedrive, Zoho CRM, or Freshsales changed pricing for our 20-person team?");
     const historical = result[0]?.observations ?? [];
     expect(historical).toHaveLength(5);
-    expect(classifyObservationComparison({ entity: "HubSpot", attribute: "Entry plan price per user per month", value: "$20/user/month", sourceUrl: "https://fixture.example/HubSpot",
+    expect(classifyObservationComparison({ entity: "HubSpot", attribute: "Entry plan price per user per month", value: "$20/user/month", sourceUrl: "https://fixture.example/HubSpot", observedAt: session.researchedAt,
       comparison: { planTier: "Starter", currency: "USD", billingInterval: "monthly", priceBasis: "per user", region: "US" } }, {
       entity: "HubSpot", attribute: "Entry plan price per user per month", value: "$25/user/month", sourceUrl: "https://fixture.example/current",
+      observedAt: "2026-11-14T12:00:00.000Z",
       comparison: { planTier: "Starter", currency: "USD", billingInterval: "monthly", priceBasis: "per user", region: "US" } },
-    )).toBe("confirmed change");
+    )).toBe("Changed");
   });
+
+  it("retrieves an older cross-chat provider comparison and compares it with fresh search evidence", async () => {
+    const { LOCAL_USER_ID } = await import("../src/lib/db");
+    const oldDate = "2025-11-03T10:00:00.000Z";
+    const historicalSession = await memory.saveResearchSession({
+      conversationId: "old-postgres-comparison-chat",
+      userId: LOCAL_USER_ID,
+      topic: "Compare Neon Supabase Railway PostgreSQL hosting pricing free tier and features",
+      summary: "Long historical answer should not be copied into the comparison context. ".repeat(40),
+      researchedAt: oldDate,
+    });
+    const providerFacts = [
+      { entity: "Neon", oldPrice: "$19/month", oldLimit: "0.5 GB storage", oldFeature: "Autoscaling to zero", currentPrice: "$25/month", currentLimit: "1 GB storage", currentFeature: "Autoscaling with scale-to-zero" },
+      { entity: "Supabase", oldPrice: "$25/month", oldLimit: "500 MB database", oldFeature: "Realtime updates", currentPrice: "$29/month", currentLimit: "1 GB database", currentFeature: "Realtime updates with branching" },
+      { entity: "Railway", oldPrice: "$5/month", oldLimit: "No free database tier", oldFeature: "Usage-based deployments", currentPrice: "$7/month", currentLimit: "$5 trial credit", currentFeature: "Usage-based deployments with templates" },
+    ] as const;
+    const priceComparison = { planTier: "Pro", currency: "USD", billingInterval: "monthly", priceBasis: "per project", region: "US" };
+    await memory.saveObservations(historicalSession.id, providerFacts.flatMap((fact) => [
+      {
+        entity: { name: fact.entity, type: "company" as const },
+        source: { url: `https://history.example/${fact.entity.toLowerCase()}`, title: `${fact.entity} historical pricing`, publishedAt: "2025-11-01" },
+        attribute: "Pro plan price", value: fact.oldPrice, comparison: priceComparison,
+      },
+      {
+        entity: { name: fact.entity, type: "company" as const },
+        source: { url: `https://history.example/${fact.entity.toLowerCase()}-limits`, title: `${fact.entity} historical limits` },
+        attribute: "Free tier limit", value: fact.oldLimit,
+      },
+      {
+        entity: { name: fact.entity, type: "company" as const },
+        source: { url: `https://history.example/${fact.entity.toLowerCase()}-features`, title: `${fact.entity} historical features` },
+        attribute: "Major features", value: fact.oldFeature,
+      },
+    ]), oldDate);
+
+    // Put the target beyond the recent-session window to verify entity-targeted lookup.
+    for (let index = 0; index < 55; index += 1) {
+      await memory.saveResearchSession({
+        conversationId: `newer-unrelated-research-${index}`,
+        userId: LOCAL_USER_ID,
+        topic: `Unrelated topic ${index}`,
+        summary: "Unrelated recent research.",
+        researchedAt: `2026-01-${String((index % 28) + 1).padStart(2, "0")}T12:00:00.000Z`,
+      });
+    }
+
+    const { findRelevantResearch, filterSupportedObservations, classifyObservationComparison } = await import("../src/agent/research-memory");
+    const query = "Last time we compared Neon, Supabase, and Railway for PostgreSQL hosting. Has their pricing, free-tier limits, or major features changed since?";
+    const history = await findRelevantResearch(LOCAL_USER_ID, query, query, true);
+    const historical = history.find((item) => item.session.topic.includes("Compare Neon Supabase Railway"));
+    expect(historical?.session.researchedAt).toBe(oldDate);
+    expect(historical?.session).not.toHaveProperty("summary");
+    expect(historical?.observations).toHaveLength(9);
+
+    vi.stubEnv("TAVILY_API_KEY", "test-only-not-a-real-key");
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const requestBody = JSON.parse(String(init?.body)) as { query: string };
+      const fact = providerFacts.find((item) => requestBody.query.toLowerCase().includes(item.entity.toLowerCase()))!;
+      const priceQuote = `${fact.entity} Pro plan costs ${fact.currentPrice} per project each month.`;
+      const limitQuote = `${fact.entity} free tier includes ${fact.currentLimit}.`;
+      const featureQuote = `${fact.entity} major features include ${fact.currentFeature}.`;
+      return Response.json({ results: [{
+        title: `${fact.entity} official plans`,
+        url: `https://${fact.entity.toLowerCase()}.example/current`,
+        content: `${priceQuote} ${limitQuote} ${featureQuote}`,
+        score: 0.99,
+        published_date: "2026-11-14",
+      }] });
+    }));
+    const { createWebSearchTool } = await import("../src/tools/web-search");
+    const searchTool = createWebSearchTool();
+    const execute = (searchTool as unknown as {
+      execute: (input: { queries: string[] }) => Promise<Array<{ searchQuery: string; title: string; url: string; content: string; retrievedAt: string }>>;
+    }).execute;
+    const currentHits = await execute({ queries: providerFacts.map((fact) => `${fact.entity} PostgreSQL hosting current pricing free tier features`) });
+    expect(currentHits).toHaveLength(3);
+
+    const currentRaw = providerFacts.flatMap((fact) => {
+      const hit = currentHits.find((item) => item.url.includes(fact.entity.toLowerCase()))!;
+      return [
+        { entity: fact.entity, entityType: "company", attribute: "Pro plan price", value: fact.currentPrice, sourceUrl: hit.url, evidenceQuote: `${fact.entity} Pro plan costs ${fact.currentPrice} per project each month.`, comparison: priceComparison },
+        { entity: fact.entity, entityType: "company", attribute: "Free tier limit", value: fact.currentLimit, sourceUrl: hit.url, evidenceQuote: `${fact.entity} free tier includes ${fact.currentLimit}.` },
+        { entity: fact.entity, entityType: "company", attribute: "Major features", value: fact.currentFeature, sourceUrl: hit.url, evidenceQuote: `${fact.entity} major features include ${fact.currentFeature}.` },
+      ];
+    });
+    const current = filterSupportedObservations({ observations: currentRaw }, currentHits);
+    expect(current).toHaveLength(9);
+
+    for (const provider of providerFacts) {
+      for (const attribute of ["Pro plan price", "Free tier limit", "Major features"]) {
+        const previous = historical!.observations.find((item) => item.entity === provider.entity && item.attribute === attribute)!;
+        const fresh = current.find((item) => item.entity.name === provider.entity && item.attribute === attribute)!;
+        const status = classifyObservationComparison({
+          entity: previous.entity,
+          attribute: previous.attribute,
+          value: previous.value,
+          sourceUrl: previous.source.url,
+          observedAt: previous.observedAt,
+          validFrom: previous.validFrom,
+          comparison: previous.comparison,
+        }, {
+          entity: fresh.entity.name,
+          attribute: fresh.attribute,
+          value: fresh.value,
+          sourceUrl: fresh.source.url,
+          observedAt: currentHits.find((hit) => hit.url === fresh.source.url)!.retrievedAt,
+          validFrom: fresh.validFrom,
+          comparison: fresh.comparison,
+        });
+        const expected = provider.entity === "Railway" && attribute === "Free tier limit" ? "Unable to verify" : "Changed";
+        expect(status, `${provider.entity} ${attribute}`).toBe(expected);
+      }
+    }
+    vi.unstubAllGlobals();
+  }, 30000);
 
   it("preserves data when opened through a fresh client after restart", async () => {
     const session = await memory.saveResearchSession({
@@ -419,20 +536,22 @@ describe("evidence validation and comparison outcomes", () => {
   it("distinguishes comparable changes from missing evidence", async () => {
     const { classifyObservationComparison } = await import("../src/agent/research-memory");
     const comparison = { planTier: "Pro", currency: "USD", billingInterval: "monthly", priceBasis: "per account", region: "US" };
-    const historical = { entity: "Neon", attribute: "Pro price", value: "$19/month", sourceUrl: "https://old.example/pricing", comparison };
-    const current = { ...historical, value: "$25/month", sourceUrl: "https://new.example/pricing" };
-    expect(classifyObservationComparison(historical, current)).toBe("confirmed change");
-    expect(classifyObservationComparison(historical, { ...historical, value: " $19/month  ", sourceUrl: "https://new.example/pricing" })).toBe("no change found in available evidence");
-    expect(classifyObservationComparison({ ...historical, value: "$19/user/month", comparison: { ...comparison, priceBasis: "per user" } }, { ...historical, value: "$25/user/month", sourceUrl: "https://new.example/pricing", comparison: { ...comparison, priceBasis: "per user" } })).toBe("confirmed change");
-    expect(classifyObservationComparison({ ...historical, value: "$19/user/month", comparison: undefined }, { ...historical, value: "$25/user/month", sourceUrl: "https://new.example/pricing", comparison: undefined })).toBe("insufficient evidence");
-    expect(classifyObservationComparison({ ...historical, value: "$19/month", comparison: undefined }, { ...historical, value: "$25/month", sourceUrl: "https://new.example/pricing", comparison: undefined })).toBe("insufficient evidence");
-    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, billingInterval: "annual" } })).toBe("insufficient evidence");
-    expect(classifyObservationComparison(historical, { ...current, value: "€25/month", comparison: { ...comparison, currency: "EUR" } })).toBe("insufficient evidence");
-    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, planTier: "Enterprise" } })).toBe("insufficient evidence");
-    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, region: undefined } })).toBe("insufficient evidence");
-    expect(classifyObservationComparison(undefined, { ...historical, sourceUrl: "https://new.example/pricing" })).toBe("insufficient evidence");
-    expect(classifyObservationComparison(historical, undefined)).toBe("insufficient evidence");
-    expect(classifyObservationComparison(historical, { ...historical, attribute: "Enterprise price", sourceUrl: "https://new.example/pricing" })).toBe("insufficient evidence");
+    const historical = { entity: "Neon", attribute: "Pro price", value: "$19/month", sourceUrl: "https://old.example/pricing", observedAt: "2025-11-03T10:00:00.000Z", comparison };
+    const current = { ...historical, value: "$25/month", sourceUrl: "https://new.example/pricing", observedAt: "2026-11-14T10:00:00.000Z" };
+    expect(classifyObservationComparison(historical, current)).toBe("Changed");
+    expect(classifyObservationComparison(historical, { ...historical, value: " $19/month  ", sourceUrl: "https://new.example/pricing", observedAt: "2026-11-14T10:00:00.000Z" })).toBe("Unchanged");
+    expect(classifyObservationComparison({ ...historical, value: "$19/user/month", comparison: { ...comparison, priceBasis: "per user" } }, { ...current, value: "$25/user/month", comparison: { ...comparison, priceBasis: "per user" } })).toBe("Changed");
+    expect(classifyObservationComparison({ ...historical, value: "$19/user/month", comparison: undefined }, { ...current, value: "$25/user/month", comparison: undefined })).toBe("Unable to verify");
+    expect(classifyObservationComparison({ ...historical, value: "$19/month", comparison: undefined }, { ...current, value: "$25/month", comparison: undefined })).toBe("Unable to verify");
+    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, billingInterval: "annual" } })).toBe("Unable to verify");
+    expect(classifyObservationComparison(historical, { ...current, value: "€25/month", comparison: { ...comparison, currency: "EUR" } })).toBe("Unable to verify");
+    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, planTier: "Enterprise" } })).toBe("Unable to verify");
+    expect(classifyObservationComparison(historical, { ...current, comparison: { ...comparison, region: undefined } })).toBe("Unable to verify");
+    expect(classifyObservationComparison(undefined, current)).toBe("Unable to verify");
+    expect(classifyObservationComparison(historical, undefined)).toBe("Unable to verify");
+    expect(classifyObservationComparison(historical, { ...current, attribute: "Enterprise price" })).toBe("Unable to verify");
+    expect(classifyObservationComparison(historical, { ...current, observedAt: historical.observedAt })).toBe("Unable to verify");
+    expect(classifyObservationComparison({ ...historical, observedAt: undefined }, current)).toBe("Unable to verify");
   });
 
   it("returns a bounded failure result when Tavily search fails", async () => {

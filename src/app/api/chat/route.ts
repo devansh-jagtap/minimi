@@ -140,10 +140,18 @@ export async function POST(request: Request) {
         try {
           const [priorResearch, priorMemories] = await Promise.all([
             findRelevantResearch(userId, retrievalQuery, body.message, true, timeZone),
-            findRelevantMemoryItems(userId, body.message),
+            findRelevantMemoryItems(userId, body.message, 4),
           ]);
           return priorResearch.length || priorMemories.length
-            ? JSON.stringify({ storedEvidence: priorResearch, durableMemories: priorMemories })
+            ? JSON.stringify({
+                storedEvidence: priorResearch,
+                durableMemories: priorMemories.map((memory) => ({
+                  type: String(memory.memory_type),
+                  summary: String(memory.summary).slice(0, 240),
+                  content: String(memory.content).slice(0, 500),
+                  createdAt: String(memory.created_at),
+                })),
+              })
             : undefined;
         } catch (error) {
           console.error("[Minimi] Historical research retrieval failed:", error);

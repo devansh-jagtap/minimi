@@ -132,34 +132,37 @@ export function filterSupportedObservations(raw: unknown, hits: SearchHit[]): Re
   });
 }
 
-export type ComparisonStatus = "confirmed change" | "no change found in available evidence" | "insufficient evidence";
+export type ComparisonStatus = "Changed" | "Unchanged" | "Unable to verify";
 
 export function classifyObservationComparison(
-  historical?: { entity: string; attribute: string; value: string; sourceUrl: string; comparison?: ResearchObservation["comparison"] },
-  current?: { entity: string; attribute: string; value: string; sourceUrl: string; comparison?: ResearchObservation["comparison"] },
+  historical?: { entity: string; attribute: string; value: string; sourceUrl: string; observedAt?: string; validFrom?: string; comparison?: ResearchObservation["comparison"] },
+  current?: { entity: string; attribute: string; value: string; sourceUrl: string; observedAt?: string; validFrom?: string; comparison?: ResearchObservation["comparison"] },
 ): ComparisonStatus {
-  if (!historical || !current || !historical.sourceUrl || !current.sourceUrl) return "insufficient evidence";
+  if (!historical || !current || !historical.sourceUrl || !current.sourceUrl) return "Unable to verify";
+  const historicalDate = Date.parse(historical.validFrom ?? historical.observedAt ?? "");
+  const currentDate = Date.parse(current.validFrom ?? current.observedAt ?? "");
+  if (!Number.isFinite(historicalDate) || !Number.isFinite(currentDate) || currentDate <= historicalDate) return "Unable to verify";
   const sameEntity = historical.entity.trim().toLocaleLowerCase("en-US") === current.entity.trim().toLocaleLowerCase("en-US");
   const sameAttribute = historical.attribute.trim().toLocaleLowerCase("en-US") === current.attribute.trim().toLocaleLowerCase("en-US");
-  if (!sameEntity || !sameAttribute) return "insufficient evidence";
+  if (!sameEntity || !sameAttribute) return "Unable to verify";
   const priceLike = /price|cost|\$|€|£|₹|\b(?:usd|eur|gbp|cad|aud|inr)\b/i.test(`${historical.attribute} ${current.attribute} ${historical.value} ${current.value}`);
   if (priceLike) {
     const requiredDimensions: Array<keyof NonNullable<ResearchObservation["comparison"]>> = ["planTier", "currency", "billingInterval", "priceBasis", "region"];
     for (const dimension of requiredDimensions) {
       const oldValue = historical.comparison?.[dimension]?.trim().toLocaleLowerCase("en-US");
       const newValue = current.comparison?.[dimension]?.trim().toLocaleLowerCase("en-US");
-      if (!oldValue || !newValue || oldValue !== newValue) return "insufficient evidence";
+      if (!oldValue || !newValue || oldValue !== newValue) return "Unable to verify";
     }
     const oldCurrency = currencyCode(historical.value);
     const newCurrency = currencyCode(current.value);
     const oldAmount = amountValues(historical.value);
     const newAmount = amountValues(current.value);
-    if (!oldAmount.length || !newAmount.length || oldCurrency !== newCurrency || oldAmount.length !== 1 || newAmount.length !== 1) return "insufficient evidence";
+    if (!oldAmount.length || !newAmount.length || oldCurrency !== newCurrency || oldAmount.length !== 1 || newAmount.length !== 1) return "Unable to verify";
   }
   const normalizeValue = (value: string) => value.trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
   return normalizeValue(historical.value) === normalizeValue(current.value)
-    ? "no change found in available evidence"
-    : "confirmed change";
+    ? "Unchanged"
+    : "Changed";
 }
 
 const STOP_WORDS = new Set([
@@ -172,6 +175,7 @@ const STOP_WORDS = new Set([
 
 const terms = (value: string) => new Set(
   (value.toLocaleLowerCase("en-US").match(/[a-z0-9][a-z0-9.+#-]*/g) ?? [])
+    .flatMap((term) => [term, ...term.split("-")])
     .filter((term) => term.length > 1 && !STOP_WORDS.has(term)),
 );
 
@@ -181,16 +185,33 @@ export function temporalMatch(query: string, timestamp: string, timeZone = "UTC"
 }
 
 export async function findRelevantResearch(ownerId: string, query: string, temporalQuery = query, globalUserScope = false, timeZone = "UTC") {
-  const sessions = await findResearchSessions(globalUserScope ? { userId: ownerId, limit: 50 } : { conversationId: ownerId, limit: 50 });
+  const entityTerms = [...terms(temporalQuery)].slice(0, 12);
+  const sessionSets = globalUserScope && entityTerms.length
+    ? await Promise.all([
+        findResearchSessions({ userId: ownerId, limit: 50 }),
+        findResearchSessions({ userId: ownerId, entityNames: entityTerms, limit: 100 }),
+      ])
+    : [await findResearchSessions(globalUserScope ? { userId: ownerId, limit: 100 } : { conversationId: ownerId, limit: 100 })];
+  const sessionsById = new Map(sessionSets.flat().map((session) => [String(session.id), session]));
+  const sessions = [...sessionsById.values()];
   if (!sessions.length) return [];
 
   const sessionIds = sessions.map((session) => String(session.id));
-  const observations = await getObservations({ sessionIds, limit: 200 });
-  const queryTerms = terms(query);
+  const observations = await getObservations({ sessionIds, limit: 500 });
+  const queryTerms = terms(`${query} ${temporalQuery}`);
   const scored = sessions.map((session) => {
     const sessionObservations = observations.filter(
       (observation) => String(observation.research_session_id) === String(session.id),
-    );
+    ).sort((a, b) => {
+      const relevance = (observation: typeof a) => {
+        const entity = String(observation.display_name);
+        const entityMatch = temporalQuery.toLocaleLowerCase("en-US").includes(entity.toLocaleLowerCase("en-US"));
+        const evidenceTerms = terms(`${String(observation.attribute)} ${String(observation.value)}`);
+        const attributeMatches = [...queryTerms].filter((term) => evidenceTerms.has(term)).length;
+        return (entityMatch ? 8 : 0) + attributeMatches * 2;
+      };
+      return relevance(b) - relevance(a) || String(b.observed_at).localeCompare(String(a.observed_at));
+    });
     const entities = [...new Set(sessionObservations.map((observation) => String(observation.display_name)))];
     const entityMatches = entities.filter((entity) =>
       query.toLocaleLowerCase("en-US").includes(entity.toLocaleLowerCase("en-US")),
@@ -206,10 +227,9 @@ export async function findRelevantResearch(ownerId: string, query: string, tempo
   return scored.map(({ session, sessionObservations }) => ({
     session: {
       topic: String(session.topic),
-      summary: String(session.summary),
       researchedAt: String(session.researched_at),
     },
-    observations: sessionObservations.slice(0, 8).map((observation) => ({
+    observations: sessionObservations.slice(0, 12).map((observation) => ({
       entity: String(observation.display_name),
       entityType: String(observation.entity_type),
       attribute: String(observation.attribute),
@@ -228,7 +248,7 @@ export async function findRelevantResearch(ownerId: string, query: string, tempo
         url: String(observation.url),
         publisher: observation.publisher ? String(observation.publisher) : undefined,
         publishedAt: observation.published_at ? String(observation.published_at) : undefined,
-        retrievedAt: String(observation.observed_at),
+        retrievedAt: String(session.researched_at),
       },
     })),
   }));
